@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+reward_model.pt
+reward_data/
