@@ -14,41 +14,95 @@ import numpy as np
 def get_roblox_region() -> Optional[dict]:
     """
     Try to get the bounding box of the Roblox window.
-    On macOS uses AppleScript to find a window whose name contains "Roblox".
+    On macOS: first try Quartz (CGWindowListCopyWindowInfo) which sees Roblox's windows;
+    if that fails, try AppleScript (System Events). Roblox often exposes 0 windows to
+    System Events, so Quartz is the reliable path.
     Returns None if not found or not on Mac.
     """
     if sys.platform != "darwin":
         return None
+    region = _get_roblox_region_quartz()
+    if region is not None:
+        return region
+    return _get_roblox_region_applescript()
+
+
+def _get_roblox_region_quartz() -> Optional[dict]:
+    """Use Quartz CGWindowListCopyWindowInfo to find Roblox window bounds. Works when System Events sees 0 windows."""
     try:
-        import subprocess
-        # Get frontmost window or search for Roblox
-        script = '''
-        tell application "System Events"
-            set wins to every window of every process whose name contains "Roblox"
-            if (count of wins) > 0 then
-                set w to item 1 of wins
-                set b to position of w
-                set s to size of w
-                return (item 1 of b) & "," & (item 2 of b) & "," & (item 1 of s) & "," & (item 2 of s)
-            end if
-        end tell
-        '''
-        out = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=2,
+        from Quartz import (
+            CGWindowListCopyWindowInfo,
+            kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+            CGDisplayBounds,
+            CGMainDisplayID,
         )
-        if out.returncode != 0 or not out.stdout.strip():
-            return None
-        parts = [int(x.strip()) for x in out.stdout.strip().split(",")]
-        if len(parts) != 4:
-            return None
-        left, top, width, height = parts
-        # Retina: AppleScript can return logical coords; we use them as-is and mss will grab that region
-        return {"left": left, "top": top, "width": width, "height": height}
+        # Get main display height for Y flip (Quartz uses bottom-left origin)
+        main_id = CGMainDisplayID()
+        bounds = CGDisplayBounds(main_id)
+        # Quartz uses bottom-left origin; convert window Y to top-left for mss
+        screen_height = int(getattr(bounds.size, "height", 1080))
+        wl = CGWindowListCopyWindowInfo(kCGWindowListExcludeDesktopElements, kCGNullWindowID)
+        best = None
+        best_area = 0
+        for w in wl:
+            owner = (w.get("kCGWindowOwnerName") or "")
+            if "roblox" not in owner.lower():
+                continue
+            b = w.get("kCGWindowBounds")
+            if not b:
+                continue
+            try:
+                x = int(b.get("X", 0))
+                y = int(b.get("Y", 0))
+                width = int(b.get("Width", 0))
+                height = int(b.get("Height", 0))
+            except (TypeError, ValueError):
+                continue
+            # Skip tiny windows (menu bar, etc.)
+            if width < 100 or height < 100:
+                continue
+            area = width * height
+            if area > best_area:
+                best_area = area
+                # Convert from bottom-left origin to top-left (for mss)
+                top = screen_height - y - height
+                best = {"left": x, "top": top, "width": width, "height": height}
+        return best
     except Exception:
         return None
+
+
+def _get_roblox_region_applescript() -> Optional[dict]:
+    """Fallback: AppleScript System Events (often 0 windows for Roblox)."""
+    try:
+        import subprocess
+        for process_name in ("Roblox", "RobloxPlayer"):
+            script = f'''
+            tell application "System Events"
+                set wins to every window of every process whose name contains "{process_name}"
+                if (count of wins) > 0 then
+                    set w to item 1 of wins
+                    set b to position of w
+                    set s to size of w
+                    return (item 1 of b) & "," & (item 2 of b) & "," & (item 1 of s) & "," & (item 2 of s)
+                end if
+            end tell
+            '''
+            out = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                parts = [int(x.strip()) for x in out.stdout.strip().split(",")]
+                if len(parts) == 4:
+                    left, top, width, height = parts
+                    return {"left": left, "top": top, "width": width, "height": height}
+    except Exception:
+        pass
+    return None
 
 
 def focus_roblox() -> bool:

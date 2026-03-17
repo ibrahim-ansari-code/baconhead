@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 reward_model.pt
 reward_data/
+policy_model.pt

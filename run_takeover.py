@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Full pipeline: when idle, take over using 10-second plans. Planner chooses actions (no forcing).
-While one 10s plan runs, we compute the next 10s with context so the next plan follows smoothly.
+Full pipeline: when idle, take over using 10s plans (Scout) or a trained policy model (--policy).
+Optional --monitor file logs each decision for pipeline monitoring.
 """
 
 import argparse
@@ -12,13 +12,17 @@ from collections import deque
 from typing import List, Optional, Tuple
 
 import mss
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
 from capture.screen import capture_region, get_roblox_region, focus_roblox_and_click
 from reward.input_state import start_listener, is_active, get_recent_activity_summary
-from llm_agent.cem import execute_action_ms
+from llm_agent.cem import run_cem, execute_action_ms
 from llm_agent.scout import plan_next_10s, _default_plan_10s
+
+LOOK_DURATION_MS = 400
+MOVE_DURATION_MS = 900
 
 
 def click_close(region: Optional[dict]) -> None:
@@ -49,6 +53,9 @@ def main():
     parser.add_argument("--reward-model", type=str, default="reward_model.pt", help="Path to reward model .pt (or empty to skip)")
     parser.add_argument("--no-reward-model", action="store_true", help="Do not load reward model")
     parser.add_argument("--no-scout", action="store_true", help="Do not call Scout (use only reward model + avoids)")
+    parser.add_argument("--policy", type=str, default=None, help="Path to trained policy model (.pt or dir); use policy instead of Scout plans")
+    parser.add_argument("--monitor", type=str, default=None, help="Append each decision to this file (ts, source, action, duration_ms)")
+    parser.add_argument("--interval", type=float, default=1.0, help="Seconds between policy steps when using --policy")
     args = parser.parse_args()
 
     region = None
@@ -83,13 +90,48 @@ def main():
     if not args.no_scout and not api_key:
         print("Warning: GROQ_API_KEY not set; Scout will be skipped. Set it for LLM scoring.", file=sys.stderr)
 
+    policy_model = None
+    policy_device = None
+    reward_model = None
+    reward_device = None
+    if args.policy and os.path.exists(args.policy):
+        import torch
+        from policy.model import load_policy_model
+        policy_device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        policy_model = load_policy_model(args.policy, device=policy_device)
+        print("Loaded policy model from", args.policy, flush=True)
+    elif args.policy:
+        print("Warning: --policy path not found; using Scout/default plans.", file=sys.stderr)
+    if not args.no_reward_model and args.reward_model and os.path.isfile(args.reward_model) and policy_model is None:
+        import torch
+        from reward.model import load_reward_model
+        reward_device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        reward_model = load_reward_model(args.reward_model, device=reward_device)
+        print("Loaded reward model from", args.reward_model, flush=True)
+
     idle_sec = args.idle
     sct = mss.mss()
     n_actions = 0
+    monitor_path = args.monitor
 
     def log(msg):
         print(msg, flush=True)
-    log("Watching. When idle " + str(idle_sec) + " s we take over with 10s plans (no forcing).")
+
+    def monitor_log(source: str, action: str, duration_ms: int):
+        if not monitor_path:
+            return
+        try:
+            with open(monitor_path, "a") as f:
+                f.write(f"{time.time():.3f}\t{source}\t{action}\t{duration_ms}\n")
+        except Exception:
+            pass
+
+    if policy_model is not None:
+        log("Watching. When idle " + str(idle_sec) + " s we take over with POLICY model (single-step).")
+    elif reward_model is not None and api_key:
+        log("Watching. When idle " + str(idle_sec) + " s we take over with CEM (Scout + reward model + avoids, single-step).")
+    else:
+        log("Watching. When idle " + str(idle_sec) + " s we take over with 10s plans (Scout).")
     log("Press Ctrl+C to stop.")
     idle_since = [None]
     last_actions: deque = deque(maxlen=16)
@@ -120,7 +162,63 @@ def main():
                 continue
             if idle_since[0] is None:
                 idle_since[0] = time.perf_counter()
-                log("[takeover] Idle detected — starting 10s-plan takeover.")
+                log("[takeover] Idle detected — starting takeover.")
+
+            # Policy mode: single-step policy model
+            if policy_model is not None:
+                from PIL import Image
+                from policy.model import frame_to_tensor
+                from policy.oracles import ACTION_NAMES
+                small = np.array(Image.fromarray(frame.astype(np.uint8)).resize((224, 224), Image.Resampling.LANCZOS))
+                pixel_values = frame_to_tensor(small, policy_model.processor, policy_device)
+                idx = policy_model.predict_action(pixel_values)
+                if isinstance(idx, list):
+                    idx = idx[0]
+                action = ACTION_NAMES[idx] if idx < len(ACTION_NAMES) else "none"
+                duration_ms = LOOK_DURATION_MS if action in ("look_left", "look_right") else MOVE_DURATION_MS
+                n_actions += 1
+                if n_actions % 8 == 1:
+                    if focus_roblox_and_click():
+                        log("[takeover] Focused Roblox.")
+                log(f"[takeover] policy step {n_actions} | {action!r} {duration_ms} ms")
+                monitor_log("policy", action, duration_ms)
+                execute_action_ms(action, duration_ms=duration_ms)
+                time.sleep(max(0.05, args.interval - duration_ms / 1000.0))
+                continue
+
+            # CEM mode: single-step Scout + reward model + avoids (when reward model loaded, no policy)
+            if reward_model is not None and api_key and not args.no_scout:
+                user_pattern = get_recent_activity_summary(seconds=120.0) or None
+                best_action, _, _, objectives, popup = run_cem(
+                    frame,
+                    reward_model=reward_model,
+                    device=reward_device,
+                    scout_api_key=api_key,
+                    use_reward_model=True,
+                    use_scout=True,
+                    avoid_weight=1.0,
+                    last_actions=list(last_actions),
+                    last_objective=last_objective,
+                    user_pattern=user_pattern,
+                )
+                if popup:
+                    log("[takeover] Popup detected — clicking close (X then No).")
+                    click_close(region)
+                    time.sleep(0.3)
+                    continue
+                if objectives:
+                    last_objective = objectives
+                last_actions.append(best_action)
+                duration_ms = LOOK_DURATION_MS if best_action in ("look_left", "look_right") else MOVE_DURATION_MS
+                n_actions += 1
+                if n_actions % 8 == 1:
+                    if focus_roblox_and_click():
+                        log("[takeover] Focused Roblox.")
+                log(f"[takeover] CEM step {n_actions} | {best_action!r} {duration_ms} ms")
+                monitor_log("cem", best_action, duration_ms)
+                execute_action_ms(best_action, duration_ms=duration_ms)
+                time.sleep(max(0.05, args.interval - duration_ms / 1000.0))
+                continue
 
             if need_plan():
                 if precomputed_plan is not None and not precomputed_popup:
@@ -173,6 +271,7 @@ def main():
                 if focus_roblox_and_click():
                     log("[takeover] Focused Roblox and clicked game window.")
             log(f"[takeover] step {plan_index + 1}/{len(current_plan)} | {action!r} {action_ms} ms")
+            monitor_log("scout_plan", action, action_ms)
             execute_action_ms(action, duration_ms=action_ms)
             last_actions.append(action)
             plan_index += 1

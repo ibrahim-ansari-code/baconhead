@@ -57,8 +57,19 @@ def run_cem(
         avoid_pen = get_avoid_penalty(frame, caption=None, use_vision=True)
         print(f"[cem] No Scout; avoid_pen(BLIP)={avoid_pen:.0f}", flush=True)
 
-    # 2) Scout-only scoring (no reward model blend)
+    # 2) Scout scores minus avoid; optional reward model: low r(s) -> boost "none"
     scores = [scout_scores[i] - avoid_weight * avoid_pen for i in range(10)]
+    if use_reward_model and reward_model is not None and device is not None:
+        import torch
+        from reward.combined import frame_to_tensor
+        with torch.no_grad():
+            x = frame_to_tensor(frame, height=84, width=84).to(device)
+            logit = reward_model(x).item()
+            r_state = max(0.0, min(1.0, torch.sigmoid(torch.tensor(logit)).item()))
+        none_idx = next((i for i, a in enumerate(actions) if a == "none"), None)
+        if none_idx is not None and r_state < 0.35:
+            scores[none_idx] += 0.4
+            print(f"[cem] reward r(s)={r_state:.2f} low -> boost none", flush=True)
 
     # 3) Repeat penalty: if same action 3+ times in a row (or space 2+), downweight it so we get variety
     if last_actions and len(last_actions) >= 2:

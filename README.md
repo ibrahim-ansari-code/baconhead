@@ -84,6 +84,37 @@ When you don't press any key for `--idle` seconds (default 3), we run **CEM** ev
 - **Preset avoids** ([reward/avoids.py](reward/avoids.py)): Keywords in frame caption (BLIP) trigger penalty: death, game over, falling, void, respawn, low health, etc. Combined with learned r(s) in [reward/combined.py](reward/combined.py).
 - **CEM** ([llm_agent/cem.py](llm_agent/cem.py)): `run_cem(frame, reward_model=..., scout_api_key=...)` returns best action and scores. `execute_action_ms(action, duration_ms=5000)` holds the key for the given milliseconds.
 
+## Policy model (fine-tuned vision)
+
+Train a Hugging Face vision model to predict the next action from a screenshot (no Scout API at inference). Multiple **oracles** define the "ideal" action per frame for labeling.
+
+**1. Collect data** (run Roblox; we capture and label with an oracle):
+
+```bash
+# avoid_only: BLIP detects danger -> none, else W (no API)
+python -m policy.collect --out-dir policy_data --oracle avoid_only --seconds 60
+
+# scout: use Llama Scout to label (needs GROQ_API_KEY)
+python -m policy.collect --out-dir policy_data --oracle scout --seconds 60
+
+# forward / random: baselines (fast, no vision API)
+python -m policy.collect --out-dir policy_data --oracle forward --max-samples 200
+```
+
+**2. Train** (ViT backbone + 8-class head):
+
+```bash
+python -m policy.train --data policy_data --out policy_model.pt --epochs 10 --freeze-backbone-epochs 2
+```
+
+**3. Take over with policy + monitoring**:
+
+```bash
+python run_takeover.py --policy policy_model.pt --monitor takeover_log.txt --interval 1.0
+```
+
+`--monitor` appends each decision (timestamp, source, action, duration_ms) so you can compare runs. Use **Scout** (default) for 10s plans or **--policy** for single-step model; try both and monitor which gets further in the obby.
+
 ## Config
 
 [config.yaml](config.yaml): `capture.*`, `agent.idle_seconds`, `agent.interval_seconds`, `agent.duration_ms`, `avoids.*` (preset phrases for penalty).

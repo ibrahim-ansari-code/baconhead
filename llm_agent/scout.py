@@ -72,8 +72,10 @@ def score_actions_with_scout(
         "If the path is to the RIGHT, give look_right 0.8-1.0 and W 0.1-0.2. Only give W 0.7+ when the path is clearly straight ahead. "
         "When unsure or when the character might fall if they go straight, prefer look_left or look_right (0.6+) to turn the camera first. "
         "Give look_left/look_right 0.1-0.2 only when going straight is clearly correct. Jumping in place = space 0.1-0.2.\n\n"
-        "Reply with exactly: AVOID=0 or AVOID=1, POPUP=0 or POPUP=1, OBJECTIVES=your one-line goal, then REWARD1=0.8 REWARD2=0.3 ... REWARD10=0.5\n"
-        "Actions in order: " + ", ".join(actions)
+        "Reply format: AVOID=0 or 1, POPUP=0 or 1, OBJECTIVES=your goal, then exactly 10 scores in order.\n"
+        "REWARD1=score for W, REWARD2=score for A, REWARD3=S, REWARD4=D, REWARD5=space, REWARD6=none, REWARD7=look_left, REWARD8=look_right, REWARD9=look_left, REWARD10=look_right.\n"
+        "Write ONLY the number after each equals sign (e.g. REWARD1=0.8 REWARD2=0.2 REWARD3=0.1 ... REWARD10=0.5). Do not put action names after the number.\n"
+        "Example: REWARD1=0.2 REWARD2=0.1 REWARD3=0.1 REWARD4=0.1 REWARD5=0.1 REWARD6=0.1 REWARD7=0.9 REWARD8=0.1 REWARD9=0.1 REWARD10=0.1"
     )
     try:
         from openai import OpenAI
@@ -107,7 +109,7 @@ def score_actions_with_scout(
     m = re.search(r"OBJECTIVES\s*=\s*([^\n]+)", text, re.IGNORECASE)
     if m:
         objectives = m.group(1).strip()[:120]
-    scores = _parse_rewards(text, n=10)
+    scores = _parse_rewards(text, n=10, actions=actions)
     if objectives:
         print(f"[scout] objectives: {objectives}", flush=True)
     if popup:
@@ -116,20 +118,37 @@ def score_actions_with_scout(
     return scores, avoid, text, objectives, popup
 
 
-def _parse_rewards(text: str, n: int = 10) -> List[float]:
-    """Extract REWARD1=... REWARD2=... from response."""
-    scores = []
+def _parse_rewards(text: str, n: int = 10, actions: Optional[List[str]] = None) -> List[float]:
+    """Extract REWARD1=... REWARD2=... from response. If model writes REWARD1=0.9 look_left, assign 0.9 to look_left index."""
+    default_actions = ["W", "A", "S", "D", "space", "none", "look_left", "look_right", "look_left", "look_right"]
+    actions = actions or default_actions
+    if len(actions) < n:
+        actions = (actions * (n // len(actions) + 1))[:n]
+    scores = [0.0] * n
+    # Indices already set by name (e.g. REWARD1=0.9 look_left) — don't overwrite with position later
+    name_set: set = set()
+    valid_action_names = {a.lower() for a in actions} | {"w", "a", "s", "d"}
+    # Match REWARDi=number optionally followed by action name (so we fix misattribution)
     for i in range(1, n + 1):
-        m = re.search(rf"REWARD{i}\s*=\s*([\d.]+)", text, re.IGNORECASE)
+        m = re.search(rf"REWARD{i}\s*=\s*([\d.]+)\s*([A-Za-z_]+)?", text, re.IGNORECASE)
         if m:
             try:
-                scores.append(float(m.group(1)))
+                value = float(m.group(1))
             except ValueError:
-                scores.append(0.0)
-        else:
-            scores.append(0.0)
-    if len(scores) < n:
-        scores.extend([0.0] * (n - len(scores)))
+                continue
+            action_after = (m.group(2) or "").strip()
+            # Only treat as action name if it's a known action (ignore "REWARD" from next token)
+            if action_after and action_after.lower() in valid_action_names and not action_after.upper().startswith("REWARD"):
+                action_lower = action_after.lower()
+                idx = next(
+                    (j for j, a in enumerate(actions) if a.lower() == action_lower or a == action_after),
+                    i - 1,
+                )
+                scores[idx] = value
+                name_set.add(idx)
+            else:
+                if (i - 1) not in name_set:
+                    scores[i - 1] = value
     return scores[:n]
 
 
