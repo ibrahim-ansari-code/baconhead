@@ -13,10 +13,18 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 SCOUT_MODEL    = "claude-sonnet-4-6"
-PLAN_ACTIONS   = ("W", "A", "S", "D", "space", "none", "look_left", "look_right")
+PLAN_ACTIONS   = ("W", "A", "S", "D", "W+space", "none", "look_left", "look_right")
 DEFAULT_MOVE_MS = 700
-DEFAULT_LOOK_MS = 350
-PLAN_TARGET_MS  = 10_000
+DEFAULT_LOOK_MS = 300
+PLAN_TARGET_MS  = 3_000
+
+# Calibrated: 220px drag ≈ 400ms ≈ ~45° in Roblox (0.55 px/ms, ~9°/100ms)
+DEGREES_PER_100MS = 9.0
+
+def _degrees_to_ms(degrees: float) -> int:
+    """Convert desired rotation degrees to look duration ms."""
+    ms = int(abs(degrees) / DEGREES_PER_100MS * 100)
+    return max(100, min(500, ms))
 
 
 def _frame_to_base64(frame: np.ndarray, max_size: int = 512) -> str:
@@ -83,10 +91,27 @@ def _parse_plan_json(text: str) -> List[Tuple[str, int]]:
         if not isinstance(item, dict):
             continue
         action = item.get("action") or item.get("action_name")
-        ms     = item.get("ms") or item.get("duration_ms") or item.get("duration")
-        if action is None or ms is None:
+        if action is None:
             continue
         action = str(action).strip()
+
+        # For look actions: accept degrees field and convert to ms
+        is_look = action.lower() in ("look_left", "look_right")
+        degrees = item.get("degrees")
+        ms      = item.get("ms") or item.get("duration_ms") or item.get("duration")
+
+        if is_look and degrees is not None:
+            try:
+                ms = _degrees_to_ms(float(degrees))
+            except (TypeError, ValueError):
+                pass
+
+        if ms is None:
+            continue
+
+        # Normalise standalone "space" to "W+space" — jumping in place is useless
+        if action.lower() == "space":
+            action = "W+space"
         if action not in PLAN_ACTIONS:
             continue
         try:
@@ -99,15 +124,14 @@ def _parse_plan_json(text: str) -> List[Tuple[str, int]]:
 
 
 def _default_plan_10s() -> List[Tuple[str, int]]:
-    """Randomised fallback plan covering ~10s with varied actions."""
+    """Randomised fallback plan covering ~3s with varied actions."""
     import random
     plans = [
-        [("look_right", 350), ("W", 700), ("space", 280), ("W", 700), ("none", 200),
-         ("W", 800), ("look_left", 300), ("W", 700), ("space", 280), ("none", 200)],
-        [("W", 600), ("space", 250), ("W", 700), ("look_right", 350), ("W", 800),
-         ("space", 280), ("none", 200), ("W", 700), ("look_left", 300), ("W", 600)],
-        [("look_left", 350), ("W", 700), ("space", 280), ("W", 600), ("none", 200),
-         ("look_right", 300), ("W", 800), ("space", 260), ("W", 700), ("none", 150)],
+        [("W", 700), ("space", 280), ("W", 600), ("none", 150)],
+        [("look_right", 300), ("W", 700), ("space", 260), ("W", 500)],
+        [("look_left", 300), ("W", 700), ("space", 260), ("W", 500)],
+        [("W", 800), ("space", 300), ("W", 700), ("none", 150)],
+        [("W", 600), ("A", 200), ("W", 600), ("space", 280)],
     ]
     return random.choice(plans)
 
@@ -144,6 +168,31 @@ def _spatial_hint(
     return "\n".join(parts)
 
 
+GAME_CONTEXT = {
+    "nds": (
+        "GAME: Natural Disaster Survival.\n"
+        "GOAL: Survive the disaster. Read the warning text at the top of the screen.\n"
+        "RULES:\n"
+        "  - Flood/Tsunami warning → find high ground immediately (stairs, hills, tall buildings). Use W+space to climb.\n"
+        "  - Tornado warning → find a solid building and go inside.\n"
+        "  - Blizzard/Acid Rain → go indoors or find shelter.\n"
+        "  - Earthquake → move away from falling debris, get to open ground.\n"
+        "  - NEVER jump in place — W+space only when moving toward safety.\n"
+        "  - If you see other players running somewhere, follow them (they know the map).\n"
+        "  - Prioritise elevation and indoor cover over staying still."
+    ),
+    "obby": (
+        "GAME: Obby (obstacle course).\n"
+        "GOAL: Reach the next checkpoint by crossing platforms without falling.\n"
+        "RULES:\n"
+        "  - Always move toward the next visible platform.\n"
+        "  - W+space to jump over gaps — time it so you're already moving forward.\n"
+        "  - Never jump in place.\n"
+        "  - If a platform is narrow, slow down (shorter W durations)."
+    ),
+}
+
+
 def plan_next_10s(
     frame: np.ndarray,
     api_key: Optional[str] = None,
@@ -155,6 +204,7 @@ def plan_next_10s(
     look_streak: int = 0,
     edge_distances: Optional[np.ndarray] = None,
     flow_mean: Optional[float] = None,
+    game: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, int]], str, bool]:
     """
     Ask Claude Sonnet 4.6 (vision) to plan the next ~10 seconds.
@@ -169,10 +219,11 @@ def plan_next_10s(
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
 
-    b64       = _frame_to_base64(frame)
-    physics   = _load_physics()
-    phys_hint = _physics_hint(physics)
-    spat_hint = _spatial_hint(edge_distances, flow_mean)
+    b64        = _frame_to_base64(frame)
+    physics    = _load_physics()
+    phys_hint  = _physics_hint(physics)
+    spat_hint  = _spatial_hint(edge_distances, flow_mean)
+    game_hint  = GAME_CONTEXT.get((game or "").lower(), "")
 
     context = ""
     if last_objective:
@@ -198,36 +249,37 @@ def plan_next_10s(
         )
 
     prompt = (
-        "You are controlling a Roblox obby character. Plan the next 10 seconds of actions.\n\n"
+        "You are controlling a Roblox character. Look at the screenshot and plan the next 3 seconds of movement.\n\n"
+        + (game_hint + "\n\n" if game_hint else "")
         + context
         + (phys_hint + "\n\n" if phys_hint else "")
         + (spat_hint + "\n\n" if spat_hint else "")
         + look_note
-        + "\nACTIONS:\n"
-        "  W = run forward (only if path is straight ahead)\n"
-        "  A/D = strafe left/right (small adjustments)\n"
-        "  S = back up\n"
-        "  space = jump (200-350ms tap for precision; 500ms for wide gaps)\n"
-        "  look_left / look_right = rotate camera (ALWAYS before W if the path bends that way)\n"
-        "  none = pause 150-300ms (after landing or when in danger)\n\n"
-        "STRATEGY:\n"
-        "  1. If the next platform is to the LEFT → look_left first, then W.\n"
-        "  2. If the next platform is to the RIGHT → look_right first, then W.\n"
-        "  3. To cross a gap: W (run) then space (jump).\n"
-        "  4. Do NOT repeat look_left/look_right more than 2 times — if you already turned, move.\n"
-        "  5. After landing from a jump, add a short none (150ms) before the next move.\n"
-        "  6. If edge_distances show you're close to an edge, move AWAY from it first.\n\n"
-        "Step 1 — Popup: ONLY return POPUP=1 if a dialog/menu is CLEARLY and FULLY blocking the game view. "
-        "If the game is visible and playable, POPUP=0.\n"
-        "Step 2 — Objective: OBJECTIVES=one short sentence.\n"
-        "Step 3 — Plan: JSON array. REQUIREMENTS:\n"
-        "  - MUST have AT LEAST 8 steps\n"
-        "  - MUST total AT LEAST 8000ms\n"
-        "  - Each step: {\"action\": \"W\", \"ms\": 700}\n"
-        "  - Duration guide: look 300-450ms | jump 250-350ms | run 500-900ms | pause 150-250ms\n"
-        "  Example (8 steps ~8s): [{\"action\":\"look_right\",\"ms\":350},{\"action\":\"W\",\"ms\":700},"
-        "{\"action\":\"space\",\"ms\":280},{\"action\":\"W\",\"ms\":700},{\"action\":\"none\",\"ms\":200},"
-        "{\"action\":\"W\",\"ms\":700},{\"action\":\"space\",\"ms\":300},{\"action\":\"W\",\"ms\":800}]\n\n"
+        + "\nCAMERA ROTATION:\n"
+        "  look_left / look_right use a 'degrees' field (not ms) to specify exact rotation.\n"
+        "  Small correction: 10-20°  |  Turn a corner: 45-90°  |  Full U-turn: 150-180°\n"
+        "  ONE look action max per plan. After looking you MUST move (W, A, D, or W+space).\n\n"
+        "ACTIONS:\n"
+        "  W          = run forward\n"
+        "  A / D      = strafe left/right (small nudge, no camera change)\n"
+        "  S          = back up\n"
+        "  W+space    = run forward AND jump (only way to jump — never jump in place)\n"
+        "  look_left  = rotate camera left  — use {\"action\":\"look_left\",\"degrees\":45}\n"
+        "  look_right = rotate camera right — use {\"action\":\"look_right\",\"degrees\":30}\n"
+        "  none       = pause 100-200ms (after landing)\n\n"
+        "RULES:\n"
+        "  1. Study the screenshot — find the path/platform/safe zone.\n"
+        "  2. Path straight ahead → W immediately.\n"
+        "  3. Need to turn → ONE look action with exact degrees, then W.\n"
+        "  4. Gap → W+space (run and jump together).\n"
+        "  5. NEVER use 2 look actions. NEVER look without moving after.\n"
+        "  6. Near an edge → S first.\n\n"
+        "Step 1 — Popup: POPUP=1 only if menu FULLY blocks screen.\n"
+        "Step 2 — Objective: OBJECTIVES=one sentence.\n"
+        "Step 3 — Plan: JSON array, ~3 seconds total (2000-3500ms of W/W+space, excluding look).\n"
+        "  Look format:  {\"action\": \"look_right\", \"degrees\": 45}\n"
+        "  Move format:  {\"action\": \"W\", \"ms\": 700}\n"
+        "  Example: [{\"action\":\"look_right\",\"degrees\":60},{\"action\":\"W\",\"ms\":700},{\"action\":\"W+space\",\"ms\":400},{\"action\":\"W\",\"ms\":600}]\n\n"
         "Reply format: POPUP=0/1, OBJECTIVES=..., then ONLY the JSON array."
     )
 
@@ -271,15 +323,36 @@ def plan_next_10s(
         print("[scout] Plan parse failed — using default.", flush=True)
         return _default_plan_10s(), objectives, popup
 
-    total_ms = sum(ms for _, ms in plan)
+    # ── hard enforcement: max 1 look action, look ms capped at 500 ──────────
+    look_count = 0
+    cleaned = []
+    for action, ms in plan:
+        is_look = action.lower() in ("look_left", "look_right")
+        if is_look:
+            if look_count >= 1:
+                print(f"[scout] Dropping extra look '{action}' (max 1 per plan)", flush=True)
+                continue
+            ms = min(ms, 500)  # hard cap ~50°
+            look_count += 1
+        cleaned.append((action, ms))
+    plan = cleaned
 
-    # If Scout returned a suspiciously short plan, extend it with sensible moves
-    if total_ms < 3000:
-        print(f"[scout] Plan too short ({total_ms}ms, {len(plan)} steps) — extending.", flush=True)
-        filler = [("W", 700), ("space", 280), ("W", 700), ("none", 200),
-                  ("W", 700), ("space", 280), ("W", 700), ("none", 200)]
-        plan = plan + filler
-        total_ms = sum(ms for _, ms in plan)
+    # ── enforce: look can't be followed by another look ──────────────────────
+    final = []
+    for i, (action, ms) in enumerate(plan):
+        is_look = action.lower() in ("look_left", "look_right")
+        prev_is_look = final and final[-1][0].lower() in ("look_left", "look_right")
+        if is_look and prev_is_look:
+            print(f"[scout] Replacing consecutive look with W", flush=True)
+            final.append(("W", 600))
+        else:
+            final.append((action, ms))
+    plan = final
+
+    total_ms = sum(ms for _, ms in plan)
+    if total_ms < 1000:
+        print(f"[scout] Plan too short ({total_ms}ms) — using default.", flush=True)
+        return _default_plan_10s(), objectives, popup
 
     print(f"[scout] Plan: {len(plan)} steps, {total_ms}ms, obj={objectives!r} popup={popup}", flush=True)
     return plan, objectives, popup

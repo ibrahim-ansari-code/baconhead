@@ -167,6 +167,7 @@ def main():
     parser.add_argument("--outcome-model", type=str,   default=None,   help="Path to outcome_model.pt for plan scoring")
     parser.add_argument("--monitor",       type=str,   default=None,   help="Log decisions to this file")
     parser.add_argument("--max-step-ms",   type=int,   default=2000,   help="Cap any single action to this many ms")
+    parser.add_argument("--game",          type=str,   default=None,   help="Game name for context-aware planning (e.g. nds, obby)")
     args = parser.parse_args()
 
     # ── region ──────────────────────────────────────────────────────────────────
@@ -196,9 +197,9 @@ def main():
         print("Using Roblox window:", region, flush=True)
 
     # ── api key ──────────────────────────────────────────────────────────────────
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not args.no_scout and not api_key:
-        print("Warning: GROQ_API_KEY not set; Scout will be skipped.", file=sys.stderr)
+        print("Warning: ANTHROPIC_API_KEY not set; Scout will be skipped.", file=sys.stderr)
 
     # ── outcome model ────────────────────────────────────────────────────────────
     outcome_model  = None
@@ -228,9 +229,10 @@ def main():
     idle_sec      = args.idle
     max_step_ms   = max(1, args.max_step_ms)
     monitor_path  = args.monitor
+    game_name     = (args.game or "").strip().lower()
     n_actions     = 0
     last_bot_time = [0.0]
-    BOT_COOLDOWN  = 0.8    # ignore "user active" for this long after a bot key press
+    BOT_COOLDOWN  = 3.0    # ignore "user active" for this long after a bot key press (pyautogui keys trip pynput)
 
     last_actions:     deque = deque(maxlen=20)
     last_objective:   Optional[str] = None
@@ -269,6 +271,7 @@ def main():
 
     try:
         while True:
+            time.sleep(0.25)   # poll at 4 Hz — prevents busy-spin and CPU overload
             frame = capture_region(region=region, sct=sct)
             now   = time.perf_counter()
             edge_dists, flow_mean = _compute_spatial(frame, prev_frame)
@@ -284,7 +287,6 @@ def main():
                 plan_index       = 0
                 precomputed_plan = None
                 look_streak[0]   = 0
-                time.sleep(0.4)
                 continue
 
             if idle_since[0] is None:
@@ -322,6 +324,7 @@ def main():
                             look_streak=consecutive_looks,
                             edge_distances=edge_dists,
                             flow_mean=flow_mean,
+                            game=game_name,
                         )
                         if popup:
                             log("[takeover] Popup detected — clicking close.")
@@ -333,21 +336,15 @@ def main():
                     else:
                         plan = _default_plan_10s()
 
-                    # ── outcome scoring: pick best among base + variants ──────
+                    # ── outcome scoring: log only, don't override Claude's plan ──
+                    # Outcome model trained on NDS data — scoring is informational until
+                    # we have enough game-specific data to trust its plan selection.
                     if outcome_model is not None and plan:
-                        candidates = [plan] + _variant_plans(plan)
-                        scores = []
-                        for c in candidates:
-                            try:
-                                s = _score_plan(c, frame, outcome_model, outcome_device, physics)
-                            except Exception:
-                                s = 0.5
-                            scores.append(s)
-                        best_idx = int(np.argmax(scores))
-                        if best_idx != 0:
-                            log(f"[takeover] Outcome model prefers variant {best_idx} "
-                                f"(P={scores[best_idx]:.2f} vs base P={scores[0]:.2f})")
-                        plan = candidates[best_idx]
+                        try:
+                            base_score = _score_plan(plan, frame, outcome_model, outcome_device, physics)
+                            log(f"[takeover] Outcome model P(survived)={base_score:.2f} (informational)")
+                        except Exception:
+                            pass
 
                     current_plan = plan
                     plan_index   = 0
@@ -399,6 +396,7 @@ def main():
                     look_streak=look_streak[0],
                     edge_distances=next_edge_dists,
                     flow_mean=next_flow_mean,
+                    game=game_name,
                 )
                 precomputed_plan  = next_plan
                 precomputed_obj   = next_obj

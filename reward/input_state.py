@@ -68,10 +68,11 @@ def get_last_key_duration() -> Optional[Tuple[str, float]]:
 
 
 def is_active(active_window_seconds: float) -> bool:
-    """True if user pressed or released a key in the last active_window_seconds."""
+    """True if user pressed or released a key in the last active_window_seconds.
+    Returns True when no key history yet — prevents bot taking over at startup."""
     t = get_last_key_time()
     if t is None:
-        return False
+        return True
     return (time.perf_counter() - t) < active_window_seconds
 
 
