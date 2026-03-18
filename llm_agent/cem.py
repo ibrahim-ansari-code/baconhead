@@ -24,10 +24,10 @@ def run_cem(
     last_objective: Optional[str] = None,
     user_pattern: Optional[str] = None,
     mock_scout_result: Optional[Tuple[List[float], float, str]] = None,
-) -> Tuple[str, List[float], float, str, bool]:
+) -> Tuple[str, List[float], float, str, bool, Optional[int]]:
     """
     Run CEM: 10 options, score each with Scout (context-aware), subtract avoid penalty, pick best.
-    Returns (best_action, list_of_scores, combined_reward_for_best, objectives_string, popup_detected).
+    Returns (best_action, list_of_scores, combined_reward_for_best, objectives_string, popup_detected, duration_ms_override).
     mock_scout_result: optional (scores[10], avoid_pen, objectives_str) or (..., popup) for testing without API.
     """
     from llm_agent.scout import score_actions_with_scout
@@ -37,16 +37,18 @@ def run_cem(
     if len(actions) != 10:
         actions = (actions * (10 // len(actions) + 1))[:10]
 
-    # 1) Scout scores + avoid + objectives + popup (or mock for tests)
+    # 1) Scout scores + avoid + objectives + popup + optional BEST/DURATION_MS (or mock for tests)
     objectives = ""
     popup = False
+    best_override = None
+    duration_override = None
     if mock_scout_result is not None:
         scout_scores, avoid_pen = mock_scout_result[0], mock_scout_result[1]
         objectives = mock_scout_result[2] if len(mock_scout_result) > 2 else ""
         popup = bool(mock_scout_result[3]) if len(mock_scout_result) > 3 else False
         scout_scores = (scout_scores + [0.5] * 10)[:10]
     elif use_scout and scout_api_key is not None:
-        scout_scores, avoid_pen, raw, objectives, popup = score_actions_with_scout(
+        scout_scores, avoid_pen, raw, objectives, popup, best_override, duration_override = score_actions_with_scout(
             frame, actions=actions, api_key=scout_api_key,
             last_actions=last_actions, last_objective=last_objective,
             user_pattern=user_pattern,
@@ -61,9 +63,14 @@ def run_cem(
     scores = [scout_scores[i] - avoid_weight * avoid_pen for i in range(10)]
     if use_reward_model and reward_model is not None and device is not None:
         import torch
-        from reward.combined import frame_to_tensor
+        from PIL import Image as _Image
+        import numpy as _np
+        def _frame_to_tensor(frame, height=84, width=84):
+            pil = _Image.fromarray(frame.astype(_np.uint8)).resize((width, height), _Image.Resampling.LANCZOS)
+            x = _np.array(pil).astype(_np.float32) / 255.0
+            return torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0)
         with torch.no_grad():
-            x = frame_to_tensor(frame, height=84, width=84).to(device)
+            x = _frame_to_tensor(frame, height=84, width=84).to(device)
             logit = reward_model(x).item()
             r_state = max(0.0, min(1.0, torch.sigmoid(torch.tensor(logit)).item()))
         none_idx = next((i for i, a in enumerate(actions) if a == "none"), None)
@@ -101,52 +108,94 @@ def run_cem(
 
     # No forced alternation: pick best action from Scout/reward; only repeat penalties and avoid apply
     idx = max(range(10), key=lambda i: scores[i])
-    best_action = actions[idx]
+    best_action = best_override if best_override else actions[idx]
     print(f"[cem] best=#{idx} {best_action!r} combined_r={scores[idx]:.3f}", flush=True)
-    return best_action, scores, scores[idx], objectives, popup
+    return best_action, scores, scores[idx], objectives, popup, duration_override
 
 
-# Mouse delta in pixels for look actions (Roblox needs a big move to turn noticeably)
+# Mouse delta in pixels for look actions. Roblox turns camera only when right-click is held and mouse moves.
 LOOK_DX = 220
 LOOK_DY = 120
 
+KEY_MAP = {
+    "w": "w", "a": "a", "s": "s", "d": "d",
+    "space": "space",
+}
+
+
+def _normalize_key(part: str):
+    p = part.strip().lower()
+    return KEY_MAP.get(p, p) if p in KEY_MAP else None
+
 
 def execute_action_ms(action: str, duration_ms: int = 5000) -> None:
-    """Execute a single action (key name or look_left/look_right) for duration_ms milliseconds."""
-    if action is None or action.lower() == "none":
+    """Execute action for duration_ms (positive only). Supports combos: W+space, look_left+W.
+    Look = right-click + mouse move. Keys can be held together."""
+    duration_ms = max(1, int(duration_ms))
+    if action is None:
         time.sleep(duration_ms / 1000.0)
         return
-    action_lower = action.lower() if isinstance(action, str) else ""
-    if action_lower in ("look_left", "look_right", "look_up", "look_down"):
-        try:
-            import pyautogui
-            look_ms = min(duration_ms, 350)
-            steps = max(6, look_ms // 45)
-            dx = (LOOK_DX if action_lower == "look_right" else -LOOK_DX if action_lower == "look_left" else 0) // steps
-            dy = (LOOK_DY if action_lower == "look_down" else -LOOK_DY if action_lower == "look_up" else 0) // steps
-            step_ms = look_ms / steps
-            for _ in range(steps):
-                pyautogui.move(dx, dy)
-                time.sleep(step_ms / 1000.0)
-            time.sleep(max(0, (duration_ms - look_ms) / 1000.0))
-        except Exception:
-            time.sleep(duration_ms / 1000.0)
-        return
-    key_map = {
-        "W": "w", "A": "a", "S": "s", "D": "d",
-        "space": "space", "Space": "space",
-    }
-    k = key_map.get(action, action.lower() if isinstance(action, str) else None)
-    if k is None:
+    action_str = action.strip()
+    if not action_str or action_str.lower() == "none":
         time.sleep(duration_ms / 1000.0)
         return
+    parts = [p.strip() for p in action_str.split("+") if p.strip()]
+    look_part = None
+    key_parts = []
+    for p in parts:
+        pl = p.lower()
+        if pl in ("look_left", "look_right", "look_up", "look_down"):
+            look_part = pl
+        else:
+            k = _normalize_key(p) or (pl if pl in KEY_MAP else None)
+            if k:
+                key_parts.append(k)
+    import pyautogui
+    from capture.screen import look_camera, get_roblox_region
     try:
-        import pyautogui
-        key = "space" if k == "space" else k
-        pyautogui.keyDown(key)
-        try:
+        if look_part and key_parts:
+            # look + movement simultaneously: hold keys in main thread, look via Quartz
+            look_dx_val = (LOOK_DX if look_part == "look_right" else
+                           -LOOK_DX if look_part == "look_left" else 0)
+            look_ms = min(duration_ms, 800)
+            import threading
+            done = threading.Event()
+            def _hold():
+                for key in key_parts:
+                    pyautogui.keyDown(key)
+                done.wait(timeout=duration_ms / 1000.0 + 0.5)
+                for key in key_parts:
+                    pyautogui.keyUp(key)
+            t = threading.Thread(target=_hold, daemon=True)
+            t.start()
+            look_camera(look_dx_val, look_ms)
+            time.sleep(max(0, (duration_ms - look_ms) / 1000.0))
+            done.set()
+            t.join(timeout=0.5)
+        elif look_part:
+            look_dx_val = (LOOK_DX if look_part == "look_right" else
+                           -LOOK_DX if look_part == "look_left" else 0)
+            look_ms = min(duration_ms, 800)
+            look_camera(look_dx_val, look_ms)
+            time.sleep(max(0, (duration_ms - look_ms) / 1000.0))
+        elif key_parts:
+            for key in key_parts:
+                pyautogui.keyDown(key)
+            try:
+                time.sleep(duration_ms / 1000.0)
+            finally:
+                for key in key_parts:
+                    pyautogui.keyUp(key)
+        else:
             time.sleep(duration_ms / 1000.0)
-        finally:
-            pyautogui.keyUp(key)
     except Exception:
+        try:
+            pyautogui.mouseUp(button="right")
+            for key in ("w", "a", "s", "d", "space"):
+                try:
+                    pyautogui.keyUp(key)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         time.sleep(duration_ms / 1000.0)

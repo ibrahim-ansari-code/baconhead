@@ -5,3 +5,4 @@ __pycache__/
 reward_model.pt
 reward_data/
 policy_model.pt
+recording_frames/

@@ -1,4 +1,4 @@
-from .model import RewardNet, load_reward_model
-from .collect import run_collect
+# reward module — episode collection and outcome model
+from .outcome_model import OutcomeModel, load_outcome_model, save_outcome_model
 
-__all__ = ["RewardNet", "load_reward_model", "run_collect"]
+__all__ = ["OutcomeModel", "load_outcome_model", "save_outcome_model"]

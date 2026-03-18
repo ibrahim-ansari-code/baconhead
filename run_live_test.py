@@ -68,7 +68,7 @@ def main():
     # 3) Run CEM (real Scout or mock)
     print("3) Running CEM (one decision)...")
     t0 = time.perf_counter()
-    best_action, scores, r, objectives, _ = run_cem(
+    best_action, scores, r, objectives, _, _ = run_cem(
         frame,
         scout_api_key=api_key,
         use_scout=bool(api_key),

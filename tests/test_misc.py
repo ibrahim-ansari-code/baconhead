@@ -52,7 +52,7 @@ def test_cem_actions_default_10():
     from llm_agent.cem import run_cem
     f = np.zeros((64, 64, 3), dtype=np.uint8)
     mock = ([0.5] * 10, 0.0, "")
-    best, scores, _, _, _ = run_cem(f, mock_scout_result=mock, use_scout=False)
+    best, scores, _, _, _, _ = run_cem(f, mock_scout_result=mock, use_scout=False)
     assert len(scores) == 10
 
 
@@ -85,7 +85,7 @@ def test_run_cem_returns_tuple():
     from llm_agent.cem import run_cem
     f = np.zeros((50, 50, 3), dtype=np.uint8)
     out = run_cem(f, mock_scout_result=([0.5] * 10, 0.0, ""), use_scout=False)
-    assert isinstance(out, tuple) and len(out) == 5
+    assert isinstance(out, tuple) and len(out) == 6
 
 
 def test_parse_rewards_import():

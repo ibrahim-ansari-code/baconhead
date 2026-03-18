@@ -8,11 +8,13 @@ On macOS, grant Accessibility permission if you need to capture keys while anoth
 import threading
 import time
 from collections import deque
-from typing import Set, Optional
+from typing import Set, Optional, Tuple
 
 _keys_down: Set[str] = set()
-_lock = threading.Lock()
+_key_press_times: dict = {}  # key -> time.perf_counter() when pressed
 _last_key_time: Optional[float] = None
+_last_key_duration: Optional[Tuple[str, float]] = None  # (key_name, duration_ms) on release
+_lock = threading.Lock()
 # Rolling log of (timestamp, key_name) for user-activity summary (max ~2 min at 10 events/s)
 _activity_log: deque = deque(maxlen=1200)
 
@@ -25,18 +27,25 @@ def _on_press(key):
         k = getattr(key, "name", str(key))
     with _lock:
         _keys_down.add(k)
-        _last_key_time = time.perf_counter()
+        now = time.perf_counter()
+        _key_press_times[k] = now
+        _last_key_time = now
         _activity_log.append((_last_key_time, k))
 
 
 def _on_release(key):
+    global _last_key_time, _last_key_duration
     try:
         k = key.char if hasattr(key, "char") and key.char else key.name
     except Exception:
         k = getattr(key, "name", str(key))
     with _lock:
+        now = time.perf_counter()
+        press_time = _key_press_times.pop(k, now)
+        duration_ms = (now - press_time) * 1000.0
+        _last_key_duration = (k, duration_ms)
         _keys_down.discard(k)
-        _last_key_time = time.perf_counter()
+        _last_key_time = now
         _activity_log.append((_last_key_time, k))
 
 
@@ -50,6 +59,12 @@ def get_last_key_time() -> Optional[float]:
     """Time of last key press or release (for active vs idle labeling)."""
     with _lock:
         return _last_key_time
+
+
+def get_last_key_duration() -> Optional[Tuple[str, float]]:
+    """(key_name, duration_ms) for the most recently released key. None if no release yet."""
+    with _lock:
+        return _last_key_duration
 
 
 def is_active(active_window_seconds: float) -> bool:

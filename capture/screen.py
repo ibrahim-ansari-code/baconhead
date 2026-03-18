@@ -151,6 +151,74 @@ def focus_roblox_and_click() -> bool:
         return True  # focus already done
 
 
+def look_camera(look_dx: int, duration_ms: int, region: Optional[dict] = None) -> None:
+    """
+    Rotate the Roblox camera by posting Quartz kCGEventRightMouseDragged events
+    with explicit kCGMouseEventDeltaX values.
+
+    This is the ONLY method that works reliably in Roblox on macOS — the game
+    reads raw delta fields from Quartz events, not absolute cursor positions.
+
+    look_dx > 0  → look right
+    look_dx < 0  → look left
+    duration_ms  → spread the drag over this many ms (smoother = more realistic)
+    """
+    if sys.platform != "darwin":
+        # Fallback for non-Mac: pyautogui drag
+        try:
+            import pyautogui
+            if region:
+                cx = region["left"] + region["width"] // 2
+                cy = region["top"] + region["height"] // 2
+                pyautogui.moveTo(cx, cy)
+            pyautogui.dragRel(look_dx, 0, button="right", duration=duration_ms / 1000.0)
+        except Exception:
+            pass
+        return
+
+    try:
+        import Quartz
+    except ImportError:
+        return
+
+    if region:
+        cx = float(region["left"] + region["width"]  // 2)
+        cy = float(region["top"]  + region["height"] // 2)
+    else:
+        cx, cy = 960.0, 540.0
+
+    steps    = max(20, abs(look_dx) // 6)
+    dx_step  = look_dx / steps
+    step_dur = duration_ms / 1000.0 / steps
+
+    x, y = cx, cy
+
+    # RightMouseDown
+    evt = Quartz.CGEventCreateMouseEvent(
+        None, Quartz.kCGEventRightMouseDown, Quartz.CGPoint(x, y), 1
+    )
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+    time.sleep(0.08)
+
+    # Dragged events — delta fields are what Roblox actually reads
+    for _ in range(steps):
+        x += dx_step
+        evt = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventRightMouseDragged, Quartz.CGPoint(x, y), 1
+        )
+        Quartz.CGEventSetIntegerValueField(evt, Quartz.kCGMouseEventDeltaX, int(round(dx_step)))
+        Quartz.CGEventSetIntegerValueField(evt, Quartz.kCGMouseEventDeltaY, 0)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+        time.sleep(step_dur)
+
+    # RightMouseUp
+    evt = Quartz.CGEventCreateMouseEvent(
+        None, Quartz.kCGEventRightMouseUp, Quartz.CGPoint(x, y), 0
+    )
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+    time.sleep(0.05)
+
+
 def capture_region(
     region: Optional[dict] = None,
     monitor: int = 0,

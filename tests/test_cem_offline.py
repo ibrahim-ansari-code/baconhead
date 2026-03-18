@@ -49,7 +49,7 @@ def test_cem_mock_prefer_w():
     frame = _fake_frame()
     # REWARD1=W, REWARD5=space, etc. Make W highest.
     mock = ([0.9, 0.2, 0.2, 0.2, 0.3, 0.0, 0.2, 0.2, 0.2, 0.2], 0.0, "move forward")
-    best, scores, r, obj, _ = run_cem(frame, mock_scout_result=mock, use_scout=False)
+    best, scores, r, obj, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False)
     assert best == "W", f"expected W got {best}"
 
 
@@ -58,7 +58,7 @@ def test_cem_anti_repeat_space():
     frame = _fake_frame()
     # Scout would return space=0.9, W=0.5. With anti-repeat we should get W.
     mock = ([0.5, 0.2, 0.2, 0.2, 0.9, 0.0, 0.5, 0.2, 0.2, 0.2], 0.0, "reach flag")
-    best, _, _, _, _ = run_cem(
+    best, _, _, _, _, _ = run_cem(
         frame,
         mock_scout_result=mock,
         use_scout=False,
@@ -72,7 +72,7 @@ def test_cem_anti_repeat_generic():
     frame = _fake_frame()
     # All W and first W index dominate; after 3x W we downweight W.
     mock = ([0.9, 0.2, 0.3, 0.2, 0.1, 0.0, 0.85, 0.2, 0.3, 0.2], 0.0, "forward")
-    best, _, _, _, _ = run_cem(
+    best, _, _, _, _, _ = run_cem(
         frame,
         mock_scout_result=mock,
         use_scout=False,
@@ -81,7 +81,7 @@ def test_cem_anti_repeat_generic():
     # After -0.4 penalty, W indices become 0.5 and 0.45; S is 0.3, A 0.3. So best could be W still if others are low.
     # Make S and A higher so we actually switch
     mock2 = ([0.9, 0.5, 0.6, 0.2, 0.1, 0.0, 0.85, 0.5, 0.6, 0.2], 0.0, "forward")
-    best2, _, _, _, _ = run_cem(
+    best2, _, _, _, _, _ = run_cem(
         frame,
         mock_scout_result=mock2,
         use_scout=False,
@@ -99,7 +99,7 @@ def test_cem_loop_diversity():
     # Mock: W=0.7, others 0.3, so without penalty we'd always get W
     for step in range(8):
         mock = ([0.7, 0.35, 0.35, 0.35, 0.2, 0.0, 0.7, 0.35, 0.35, 0.35], 0.0, "go forward")
-        best, _, _, obj, _ = run_cem(
+        best, _, _, obj, _, _ = run_cem(
             frame,
             mock_scout_result=mock,
             use_scout=False,
@@ -122,7 +122,7 @@ def test_cem_mock_avoid_penalty():
     """With avoid_pen=1, scores reduced; phase=move so W or A can win."""
     frame = _fake_frame()
     mock = ([0.6, 0.5, 0.2, 0.2, 0.1, 0.0, 0.6, 0.5, 0.2, 0.2], 1.0, "danger")
-    best, scores, r, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, avoid_weight=1.0, last_actions=[])
+    best, scores, r, _, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, avoid_weight=1.0, last_actions=[])
     assert r <= 0.6, "combined score should be reduced by avoid"
     assert best == "W"  # phase=move; W and A scores -avoid; W wins
 
@@ -131,7 +131,7 @@ def test_cem_mock_none_action():
     """When 'none' is best (index 5) in move phase, we get 'none'."""
     frame = _fake_frame()
     mock = ([0.1, 0.1, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1], 0.0, "wait")
-    best, _, r, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, last_actions=[])
+    best, _, r, _, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, last_actions=[])
     assert best == "none"
     assert r == 0.9
 
@@ -140,7 +140,7 @@ def test_cem_mock_objectives_returned():
     """mock_scout_result objectives string should be returned."""
     frame = _fake_frame()
     mock = ([0.5] * 10, 0.0, "reach the red flag")
-    _, _, _, obj, _ = run_cem(frame, mock_scout_result=mock, use_scout=False)
+    _, _, _, obj, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False)
     assert obj == "reach the red flag"
 
 
@@ -149,7 +149,7 @@ def test_cem_mock_actions_list_stability():
     frame = _fake_frame()
     actions = ["W", "A", "S", "D", "space", "none", "W", "A", "S", "D"]
     mock = ([0.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.0, "")
-    best, _, _, _, _ = run_cem(frame, actions=actions, mock_scout_result=mock, use_scout=False, last_actions=[])
+    best, _, _, _, _, _ = run_cem(frame, actions=actions, mock_scout_result=mock, use_scout=False, last_actions=[])
     assert best == "A"
 
 
@@ -157,7 +157,7 @@ def test_cem_no_phase_forcing_best_wins():
     """No phase forcing: best action by score wins regardless of last action."""
     frame = _fake_frame()
     mock = ([0.9, 0.8, 0.7, 0.6, 0.5, 0.1, 0.3, 0.4, 0.3, 0.4], 0.0, "")
-    best, _, _, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, last_actions=["W"])
+    best, _, _, _, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, last_actions=["W"])
     assert best == "W", f"highest score is W (0.9), got {best}"
 
 
@@ -165,7 +165,7 @@ def test_cem_no_phase_forcing_look_can_win():
     """No phase forcing: look can win when it has highest score (indices 6–9 are look)."""
     frame = _fake_frame()
     mock = ([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.9, 0.9, 0.9, 0.9], 0.0, "")
-    best, _, _, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, last_actions=["look_right"])
+    best, _, _, _, _, _ = run_cem(frame, mock_scout_result=mock, use_scout=False, last_actions=["look_right"])
     assert best in ("look_left", "look_right"), f"highest scores are look actions, got {best}"
 
 
