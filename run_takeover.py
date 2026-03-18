@@ -36,6 +36,28 @@ from llm_agent.cem import execute_action_ms
 from llm_agent.scout import plan_next_10s, _default_plan_10s
 
 
+def _compute_spatial(frame: np.ndarray, prev_frame: Optional[np.ndarray]):
+    """Return (edge_distances (4,), flow_mean float) from a frame pair."""
+    try:
+        from reward.collect_episodes import compute_edge_distances, compute_flow_features, N_BUCKETS
+        import cv2
+        from PIL import Image as _Image
+        frame_224 = np.array(_Image.fromarray(frame.astype(np.uint8)).resize((224, 224), _Image.Resampling.LANCZOS))
+        edge_dists = compute_edge_distances(frame_224)
+        if prev_frame is not None:
+            prev_224 = np.array(_Image.fromarray(prev_frame.astype(np.uint8)).resize((224, 224), _Image.Resampling.LANCZOS))
+            gray1 = cv2.cvtColor(prev_224, cv2.COLOR_RGB2GRAY)
+            gray2 = cv2.cvtColor(frame_224, cv2.COLOR_RGB2GRAY)
+            flow  = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag   = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+            flow_mean = float(mag.mean())
+        else:
+            flow_mean = 0.0
+        return edge_dists, flow_mean
+    except Exception:
+        return None, None
+
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def click_close(region: Optional[dict]) -> None:
@@ -243,10 +265,14 @@ def main():
     log(f"Watching. Takeover after {idle_sec}s idle. Scout={'on' if use_scout else 'off'} OutcomeModel={'on' if outcome_model else 'off'}.")
     log("Press Ctrl+C to stop.")
 
+    prev_frame: Optional[np.ndarray] = None
+
     try:
         while True:
             frame = capture_region(region=region, sct=sct)
             now   = time.perf_counter()
+            edge_dists, flow_mean = _compute_spatial(frame, prev_frame)
+            prev_frame = frame
 
             # ── user active? ──────────────────────────────────────────────────
             in_cooldown = (now - last_bot_time[0]) < BOT_COOLDOWN
@@ -294,6 +320,8 @@ def main():
                             user_pattern=user_pattern,
                             last_objective=last_objective,
                             look_streak=consecutive_looks,
+                            edge_distances=edge_dists,
+                            flow_mean=flow_mean,
                         )
                         if popup:
                             log("[takeover] Popup detected — clicking close.")
@@ -360,6 +388,7 @@ def main():
                     and use_scout):
                 next_frame    = capture_region(region=region, sct=sct)
                 user_pattern  = get_recent_activity_summary(seconds=120.0) or None
+                next_edge_dists, next_flow_mean = _compute_spatial(next_frame, frame)
                 next_plan, next_obj, next_popup = plan_next_10s(
                     next_frame,
                     api_key=api_key,
@@ -368,6 +397,8 @@ def main():
                     user_pattern=user_pattern,
                     last_objective=last_objective,
                     look_streak=look_streak[0],
+                    edge_distances=next_edge_dists,
+                    flow_mean=next_flow_mean,
                 )
                 precomputed_plan  = next_plan
                 precomputed_obj   = next_obj

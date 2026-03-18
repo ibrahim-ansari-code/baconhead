@@ -1,9 +1,7 @@
 """
-Llama 4 Scout (Groq vision): plan the next ~10 seconds of obby actions.
+Claude Sonnet 4.6 (Anthropic vision): plan the next ~10 seconds of obby actions.
 
 Only one public function is exposed: plan_next_10s().
-The old score_actions_with_scout / REWARD1-10 multi-output scoring has been removed —
-it produced noisy, repetitive results. We now generate one structured plan per call.
 """
 
 import base64
@@ -14,7 +12,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-SCOUT_MODEL    = "meta-llama/llama-4-maverick-17b-128e-instruct"
+SCOUT_MODEL    = "claude-sonnet-4-6"
 PLAN_ACTIONS   = ("W", "A", "S", "D", "space", "none", "look_left", "look_right")
 DEFAULT_MOVE_MS = 700
 DEFAULT_LOOK_MS = 350
@@ -114,6 +112,38 @@ def _default_plan_10s() -> List[Tuple[str, int]]:
     return random.choice(plans)
 
 
+def _spatial_hint(
+    edge_distances: Optional[np.ndarray],
+    flow_mean: Optional[float],
+) -> str:
+    """Build a plain-English spatial context string from edge distances and flow."""
+    parts = []
+    if edge_distances is not None and len(edge_distances) == 4:
+        labels = ["top", "right", "bottom", "left"]
+        edge_strs = []
+        for label, dist in zip(labels, edge_distances):
+            pct = int(dist * 100)
+            if pct < 10:
+                edge_strs.append(f"{label}={pct}% (VERY CLOSE TO EDGE)")
+            elif pct < 25:
+                edge_strs.append(f"{label}={pct}% (close)")
+            else:
+                edge_strs.append(f"{label}={pct}%")
+        parts.append("Platform edge distances (% of screen to edge): " + ", ".join(edge_strs) + ".")
+        # warn about dangerous edges
+        dangers = [l for l, d in zip(labels, edge_distances) if d < 0.12]
+        if dangers:
+            parts.append(f"⚠ DANGER: very close to {'/'.join(dangers)} edge — avoid moving that direction.")
+    if flow_mean is not None:
+        if flow_mean < 0.5:
+            parts.append("Motion: nearly stationary (character barely moving).")
+        elif flow_mean < 3.0:
+            parts.append(f"Motion: slow movement (flow={flow_mean:.1f}).")
+        else:
+            parts.append(f"Motion: actively moving (flow={flow_mean:.1f}).")
+    return "\n".join(parts)
+
+
 def plan_next_10s(
     frame: np.ndarray,
     api_key: Optional[str] = None,
@@ -123,21 +153,26 @@ def plan_next_10s(
     user_pattern: Optional[str] = None,
     last_objective: Optional[str] = None,
     look_streak: int = 0,
+    edge_distances: Optional[np.ndarray] = None,
+    flow_mean: Optional[float] = None,
 ) -> Tuple[List[Tuple[str, int]], str, bool]:
     """
-    Ask Llama 4 Scout (vision) to plan the next ~10 seconds.
+    Ask Claude Sonnet 4.6 (vision) to plan the next ~10 seconds.
     Returns (plan: list of (action, ms), objectives: str, popup_detected: bool).
 
     look_streak: number of consecutive look_left/look_right actions already executed.
                  When >= 2, the prompt tells the model to use W or W+space instead of more turns.
+    edge_distances: (4,) array [top, right, bottom, left] normalised to [0, 1].
+    flow_mean: mean optical flow magnitude over the last frame pair.
     """
-    api_key = api_key or os.environ.get("GROQ_API_KEY")
+    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        raise ValueError("GROQ_API_KEY not set")
+        raise ValueError("ANTHROPIC_API_KEY not set")
 
-    b64      = _frame_to_base64(frame)
-    physics  = _load_physics()
+    b64       = _frame_to_base64(frame)
+    physics   = _load_physics()
     phys_hint = _physics_hint(physics)
+    spat_hint = _spatial_hint(edge_distances, flow_mean)
 
     context = ""
     if last_objective:
@@ -154,7 +189,6 @@ def plan_next_10s(
             "Output ONLY actions that come AFTER the above.\n\n"
         )
 
-    # Anti-look-repeat instruction
     look_note = ""
     if look_streak >= 2:
         look_note = (
@@ -167,6 +201,7 @@ def plan_next_10s(
         "You are controlling a Roblox obby character. Plan the next 10 seconds of actions.\n\n"
         + context
         + (phys_hint + "\n\n" if phys_hint else "")
+        + (spat_hint + "\n\n" if spat_hint else "")
         + look_note
         + "\nACTIONS:\n"
         "  W = run forward (only if path is straight ahead)\n"
@@ -180,7 +215,8 @@ def plan_next_10s(
         "  2. If the next platform is to the RIGHT → look_right first, then W.\n"
         "  3. To cross a gap: W (run) then space (jump).\n"
         "  4. Do NOT repeat look_left/look_right more than 2 times — if you already turned, move.\n"
-        "  5. After landing from a jump, add a short none (150ms) before the next move.\n\n"
+        "  5. After landing from a jump, add a short none (150ms) before the next move.\n"
+        "  6. If edge_distances show you're close to an edge, move AWAY from it first.\n\n"
         "Step 1 — Popup: ONLY return POPUP=1 if a dialog/menu is CLEARLY and FULLY blocking the game view. "
         "If the game is visible and playable, POPUP=0.\n"
         "Step 2 — Objective: OBJECTIVES=one short sentence.\n"
@@ -196,22 +232,29 @@ def plan_next_10s(
     )
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-        print("[scout] Planning next 10s...", flush=True)
-        resp = client.chat.completions.create(
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        print("[scout] Planning next 10s with Claude Sonnet 4.6...", flush=True)
+        resp = client.messages.create(
             model=model,
+            max_tokens=900,
+            temperature=0.5,
             messages=[{
                 "role": "user",
                 "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": b64,
+                        },
+                    },
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }],
-            max_tokens=900,
-            temperature=0.5,
         )
-        text = resp.choices[0].message.content or ""
+        text = resp.content[0].text if resp.content else ""
         print(f"[scout] response ({len(text)} chars)", flush=True)
     except Exception as e:
         print(f"[scout] ERROR: {e}", flush=True)

@@ -188,15 +188,16 @@ def compute_edge_distances(frame: np.ndarray) -> np.ndarray:
 def _is_death_frame(frame: np.ndarray, prev_frame: Optional[np.ndarray]) -> bool:
     """
     Heuristic death detection:
-    1. Bright-white flash: mean pixel > 200 across all channels.
-    2. Large sudden frame diff compared to previous: mean absolute diff > 50.
+    1. Bright-white flash: mean pixel > 220 (tight — avoids blizzard false positives).
+    2. Large sudden frame diff > 70 (raised from 50 to reduce disaster false positives).
+    Both conditions must be sustained — blizzards are gradual, deaths are abrupt.
     """
     mean_bright = float(frame.mean())
-    if mean_bright > 200:
+    if mean_bright > 220:
         return True
     if prev_frame is not None:
         diff = float(np.mean(np.abs(frame.astype(np.float32) - prev_frame.astype(np.float32))))
-        if diff > 50:
+        if diff > 70:
             return True
     return False
 
