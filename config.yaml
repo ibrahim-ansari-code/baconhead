@@ -1,17 +1,85 @@
-# Capture config for Roblox gameplay
+# Roblox Obby RL Agent — Configuration
+
 capture:
-  fps: 10
-  region: null
-  monitor: 0
+  # Game window region. Set to null to auto-detect, or specify manually:
+  # game_region: {top: 0, left: 0, width: 1920, height: 1080}
+  game_region: null
 
-# Idle takeover + CEM
+  # Stage counter HUD crop, relative to the game window top-left.
+  # These are defaults — calibrate for your specific obby.
+  hud_roi:
+    top: 90
+    left: 780
+    width: 180
+    height: 55
+
+  # Target capture rate (frames per second). Must be 2–5 per spec.
+  fps: 4
+
+  # OCR backend: "easyocr" or "pytesseract"
+  ocr_backend: "easyocr"
+
+  # Use GPU for easyocr (true/false). Set true if CUDA is available.
+  ocr_gpu: false
+
+  # Void color HSV range for death detection and edge proximity detection.
+  # Calibrate these values empirically on the target obby before Phase 2 begins.
+  # Format: [H, S, V] in OpenCV HSV scale (H: 0-179, S: 0-255, V: 0-255)
+  void_hsv_lower: [91, 54, 210]
+  void_hsv_upper: [116, 180, 255]
+
+  # Full-frame void ratio threshold for death detection (0.0–1.0).
+  # A ratio above this value for death_debounce_frames consecutive frames triggers a death event.
+  death_void_ratio_threshold: 0.75
+
+  # Number of consecutive frames above threshold required to trigger death event.
+  death_debounce_frames: 2
+
+control:
+  # Main loop target FPS. Must be 2–5 per spec.
+  fps: 5
+
+  # Key hold duration per action step (seconds). Should equal 1/fps.
+  hold_duration: 0.200
+
+  # Game window bounds for camera setup. Set to null to use defaults (full primary monitor).
+  game_window:
+    x: 0
+    y: 0
+    width: 1920
+    height: 1080
+
 agent:
-  idle_seconds: 3.0      # No key press for this long -> we take over
-  interval_seconds: 5.0  # T: run CEM every 5s
-  duration_ms: 5000      # Hold chosen key for this many milliseconds
+  # LLM backend: "anthropic" or "openai"
+  llm_backend: "anthropic"
 
-# Preset avoids (reward penalty when detected from frame)
-avoids:
-  losing_health: ["low health", "no health", "died", "death", "dead", "game over", "respawn", "failed"]
-  falling_off_map: ["falling", "fell", "void", "respawn", "out of bounds", "fell off", "death", "dead", "game over"]
-  death_screen: ["game over", "you died", "dead", "respawn", "defeat", "failed"]
+  # Model override (null = use default for the backend)
+  llm_model: null
+
+  # Seconds between LLM strategic calls
+  llm_interval: 5.0
+
+twotier:
+  cnn_fps: 20
+  bias_scale: 2.0
+  respawn_wait: 3.0
+  respawn_timeout: 10.0
+  respawn_void_threshold: 0.3
+  ocr_every_n_frames: 10
+  checkpoint: "checkpoints/bc_best.pt"
+  uncertainty_threshold: 0.5
+
+training:
+  # Seconds without stage progress before stuck detection fires.
+  stuck_timeout: 30
+
+  # Total PPO training timesteps.
+  total_timesteps: 1000000
+
+  # PPO hyperparameters (Stable Baselines3).
+  learning_rate: 2.5e-4
+  n_steps: 128
+  batch_size: 32
+  n_epochs: 4
+  gamma: 0.99
+  clip_range: 0.1

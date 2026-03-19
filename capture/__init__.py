@@ -1,3 +1,3 @@
-from .screen import capture_region, get_roblox_region, capture_loop
+from capture.screen import Capturer
 
-__all__ = ["capture_region", "get_roblox_region", "capture_loop"]
+__all__ = ["Capturer"]

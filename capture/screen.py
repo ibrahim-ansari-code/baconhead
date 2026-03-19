@@ -1,174 +1,248 @@
 """
-Screen capture for Roblox gameplay.
-Uses mss for fast capture. Can target a configurable region or try to find the Roblox window (Mac).
+capture/screen.py — Screen capture and OCR for the Roblox obby agent.
+
+Public interface:
+    Capturer.current_stage : int   — most recently read stage number
+    Capturer.death_event   : bool  — True for exactly one frame when death detected
+
+All other state is internal.
 """
 
+from __future__ import annotations
+
+import logging
 import time
-import sys
+from pathlib import Path
 from typing import Optional
 
 import mss
+import mss.tools
 import numpy as np
+import yaml
+from PIL import Image
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 
 
-def get_roblox_region() -> Optional[dict]:
-    """
-    Try to get the bounding box of the Roblox window.
-    On macOS uses AppleScript to find a window whose name contains "Roblox".
-    Returns None if not found or not on Mac.
-    """
-    if sys.platform != "darwin":
-        return None
-    try:
-        import subprocess
-        # Get frontmost window or search for Roblox
-        script = '''
-        tell application "System Events"
-            set wins to every window of every process whose name contains "Roblox"
-            if (count of wins) > 0 then
-                set w to item 1 of wins
-                set b to position of w
-                set s to size of w
-                return (item 1 of b) & "," & (item 2 of b) & "," & (item 1 of s) & "," & (item 2 of s)
-            end if
-        end tell
-        '''
-        out = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if out.returncode != 0 or not out.stdout.strip():
-            return None
-        parts = [int(x.strip()) for x in out.stdout.strip().split(",")]
-        if len(parts) != 4:
-            return None
-        left, top, width, height = parts
-        # Retina: AppleScript can return logical coords; we use them as-is and mss will grab that region
-        return {"left": left, "top": top, "width": width, "height": height}
-    except Exception:
-        return None
+def _load_config() -> dict:
+    with open(_CONFIG_PATH, "r") as f:
+        return yaml.safe_load(f)["capture"]
 
 
-def focus_roblox() -> bool:
-    """
-    On macOS: bring the Roblox window to front so key presses go to the game.
-    Returns True if we focused (or tried), False if not Mac.
-    """
-    if sys.platform != "darwin":
-        return False
-    try:
-        import subprocess
-        script = '''
-        tell application "System Events"
-            set procs to every process whose name contains "Roblox"
-            if (count of procs) > 0 then
-                set frontmost of item 1 of procs to true
-                return "ok"
-            end if
-        end tell
-        '''
-        out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
-        return out.returncode == 0 and "ok" in (out.stdout or "")
-    except Exception:
-        return False
+# ---------------------------------------------------------------------------
+# OCR backends
+# ---------------------------------------------------------------------------
+
+class _EasyOCRBackend:
+    def __init__(self, gpu: bool) -> None:
+        import easyocr  # deferred — slow to import
+        self._reader = easyocr.Reader(["en"], gpu=gpu)
+        log.info("EasyOCR backend initialised (gpu=%s)", gpu)
+
+    def read(self, image: np.ndarray) -> str:
+        results = self._reader.readtext(image, detail=0)
+        return " ".join(results).strip()
 
 
-def focus_roblox_and_click() -> bool:
-    """
-    Focus Roblox, then click the center of its window so the game captures keyboard/mouse.
-    Many games only accept input after a click inside the window.
-    """
-    if not focus_roblox():
-        return False
-    time.sleep(0.2)
-    region = get_roblox_region()
-    if not region:
-        return True  # focus worked, no region for click
-    try:
-        import pyautogui
-        cx = region["left"] + region["width"] // 2
-        cy = region["top"] + region["height"] // 2
-        pyautogui.click(cx, cy)
-        time.sleep(0.15)
-        return True
-    except Exception:
-        return True  # focus already done
+class _TesseractBackend:
+    def __init__(self) -> None:
+        import pytesseract  # deferred
+        self._pytesseract = pytesseract
+        log.info("Pytesseract backend initialised")
+
+    def read(self, image: np.ndarray) -> str:
+        pil_img = Image.fromarray(image)
+        # PSM 7 = treat as single line of text; whitelist digits and slash
+        cfg = "--psm 7"
+        return self._pytesseract.image_to_string(pil_img, config=cfg).strip()
 
 
-def capture_region(
-    region: Optional[dict] = None,
-    monitor: int = 0,
-    sct: Optional[mss.mss.MSS] = None,
-) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Stage number parser
+# ---------------------------------------------------------------------------
+
+def _parse_stage(raw: str) -> Optional[int]:
     """
-    Capture a screen region (or full monitor) and return as numpy array (RGB, height x width x 3).
-    If region is None, captures the given monitor (default primary).
+    Extract the stage number from raw OCR text like 'Stage 12 (5%)' or 'Stage 12/100'.
+    Falls back to the first integer found if the pattern isn't matched.
+    Returns None if nothing parseable is found.
     """
-    own_sct = False
-    if sct is None:
-        sct = mss.mss()
-        own_sct = True
-    try:
-        if region is not None:
-            box = region
-        else:
-            mon = sct.monitors[monitor]
-            box = {
-                "left": mon["left"],
-                "top": mon["top"],
-                "width": mon["width"],
-                "height": mon["height"],
-            }
-        raw = sct.grab(box)
-        # mss returns BGRA; convert to RGB
-        img = np.array(raw)[:, :, :3][:, :, ::-1]  # BGR -> RGB
-        return img
-    finally:
-        if own_sct:
-            sct.close()
+    import re
+    # Primary: match "Stage <number>" explicitly
+    m = re.search(r"[Ss]tage\s+(\d+)", raw)
+    if m:
+        return int(m.group(1))
+    # Fallback: first number in string
+    numbers = re.findall(r"\d+", raw)
+    if numbers:
+        return int(numbers[0])
+    return None
 
 
-def capture_loop(
-    region: Optional[dict] = None,
-    monitor: int = 0,
-    fps: float = 10.0,
-    callback=None,
-    stop_event=None,
-):
+# ---------------------------------------------------------------------------
+# Main Capturer class
+# ---------------------------------------------------------------------------
+
+class Capturer:
     """
-    Run a capture loop at the given FPS.
-    - region: optional {left, top, width, height}; if None uses monitor.
-    - monitor: monitor index when region is None.
-    - fps: target capture rate.
-    - callback: called as callback(frame: np.ndarray, timestamp: float) each frame. If None, frames are discarded (useful for FPS test).
-    - stop_event: optional threading.Event or similar; when set, loop exits.
-    """
-    interval = 1.0 / fps
-    sct = mss.mss()
-    try:
-        if region is None:
-            mon = sct.monitors[monitor]
-            region = {
-                "left": mon["left"],
-                "top": mon["top"],
-                "width": mon["width"],
-                "height": mon["height"],
-            }
-        next_ts = time.perf_counter()
+    Handles screen capture, OCR, and death detection.
+
+    Usage:
+        cap = Capturer()
         while True:
-            if stop_event is not None and stop_event.is_set():
-                break
-            now = time.perf_counter()
-            if now >= next_ts:
-                frame = capture_region(region=region, sct=sct)
-                if callback is not None:
-                    callback(frame, now)
-                next_ts = next_ts + interval
-                if next_ts < now:
-                    next_ts = now + interval
-            else:
-                time.sleep(min(interval * 0.5, next_ts - now))
-    finally:
-        sct.close()
+            cap.tick()
+            stage = cap.current_stage
+            died  = cap.death_event
+    """
+
+    def __init__(self) -> None:
+        cfg = _load_config()
+
+        self._game_region: Optional[dict] = cfg.get("game_region")  # None = auto
+        self._hud_roi: dict = cfg["hud_roi"]
+        self._fps: float = cfg.get("fps", 4)
+        self._death_debounce: int = cfg.get("death_debounce_frames", 2)
+
+        # Void HSV bounds for death detection (Phase 2)
+        self._void_hsv_lower = np.array(cfg.get("void_hsv_lower", [0, 0, 0]), dtype=np.uint8)
+        self._void_hsv_upper = np.array(cfg.get("void_hsv_upper", [179, 255, 50]), dtype=np.uint8)
+        self._death_ratio_threshold: float = cfg.get("death_void_ratio_threshold", 0.85)
+
+        # OCR backend
+        backend_name = cfg.get("ocr_backend", "easyocr").lower()
+        gpu = cfg.get("ocr_gpu", False)
+        if backend_name == "easyocr":
+            self._ocr = _EasyOCRBackend(gpu=gpu)
+        elif backend_name == "pytesseract":
+            self._ocr = _TesseractBackend()
+        else:
+            raise ValueError(f"Unknown ocr_backend: {backend_name!r}")
+
+        # State
+        self.current_stage: int = 1
+        self.death_event: bool = False
+        self.last_raw_ocr: str = ""  # raw OCR output from last tick
+        self.last_frame: Optional[np.ndarray] = None  # BGR frame from last tick
+
+        self._void_counter: int = 0  # consecutive void-fall frames
+        self._frame_interval: float = 1.0 / self._fps
+        self._last_tick: float = 0.0
+
+        log.info(
+            "Capturer ready — game_region=%s hud_roi=%s fps=%s",
+            self._game_region,
+            self._hud_roi,
+            self._fps,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def tick(self) -> None:
+        """Capture one frame, run OCR and death detection, update public state."""
+        now = time.monotonic()
+        elapsed = now - self._last_tick
+        if elapsed < self._frame_interval:
+            time.sleep(self._frame_interval - elapsed)
+        self._last_tick = time.monotonic()
+
+        with mss.mss() as sct:
+            region = self._resolve_region(sct)
+            raw_frame = np.array(sct.grab(region))  # BGRA uint8
+
+        # Convert to BGR (drop alpha)
+        frame_bgr = raw_frame[:, :, :3]
+        self.last_frame = frame_bgr
+
+        # --- OCR ---
+        stage = self._run_ocr(frame_bgr)
+        if stage is not None:
+            self.current_stage = stage
+
+        # --- Death detection ---
+        self.death_event = self._detect_death(frame_bgr)
+
+    def tick_fast(self) -> None:
+        """Capture frame and run death detection only (no OCR). For 20fps loops."""
+        with mss.mss() as sct:
+            region = self._resolve_region(sct)
+            raw_frame = np.array(sct.grab(region))  # BGRA uint8
+
+        frame_bgr = raw_frame[:, :, :3]
+        self.last_frame = frame_bgr
+
+        self.death_event = self._detect_death(frame_bgr)
+
+    def run_loop(self) -> None:
+        """Blocking capture loop. Runs until KeyboardInterrupt."""
+        log.info("Capture loop starting at %.1f fps", self._fps)
+        try:
+            while True:
+                self.tick()
+        except KeyboardInterrupt:
+            log.info("Capture loop stopped by user")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_region(self, sct: mss.base.MSSBase) -> dict:
+        """Return the mss grab region for the game window."""
+        if self._game_region is not None:
+            return self._game_region
+        # Fall back to primary monitor
+        monitor = sct.monitors[1]  # index 1 = primary monitor
+        return {
+            "top": monitor["top"],
+            "left": monitor["left"],
+            "width": monitor["width"],
+            "height": monitor["height"],
+        }
+
+    def _crop_hud(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Crop the HUD stage counter region from a full game frame."""
+        roi = self._hud_roi
+        t = roi["top"]
+        l = roi["left"]
+        h = roi["height"]
+        w = roi["width"]
+        return frame_bgr[t : t + h, l : l + w]
+
+    def _run_ocr(self, frame_bgr: np.ndarray) -> Optional[int]:
+        """Run OCR on the HUD crop and return the parsed stage number."""
+        hud_crop = self._crop_hud(frame_bgr)
+        raw = self._ocr.read(hud_crop)
+        self.last_raw_ocr = raw
+        parsed = _parse_stage(raw)
+        log.debug("OCR raw=%r parsed=%s", raw, parsed)
+        return parsed
+
+    def _detect_death(self, frame_bgr: np.ndarray) -> bool:
+        """
+        Detect death by void fall using HSV void ratio.
+        Returns True on the first frame of a confirmed death (after debounce).
+        """
+        from vision.perception import compute_scene_state
+
+        state = compute_scene_state(frame_bgr, self._void_hsv_lower, self._void_hsv_upper)
+        void_ratio = state["void_ratio"]
+
+        log.debug("void_ratio=%.3f", void_ratio)
+
+        if void_ratio > self._death_ratio_threshold:
+            self._void_counter += 1
+        else:
+            self._void_counter = 0
+
+        if self._void_counter == self._death_debounce:
+            log.info("Death detected (void_ratio=%.3f)", void_ratio)
+            return True
+
+        return False

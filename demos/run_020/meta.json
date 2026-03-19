@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-03-18T16:49:27.278043",
+  "fps": 5,
+  "num_frames": 94,
+  "duration_seconds": 19.16,
+  "action_distribution": {
+    "forward": 32,
+    "left": 8,
+    "right": 7,
+    "jump": 4,
+    "forward_jump": 8,
+    "idle": 35
+  }
+}

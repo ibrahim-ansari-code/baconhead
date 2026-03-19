@@ -1,0 +1,158 @@
+"""
+agent/planner.py — Gemini high-level planner for the two-tier agent.
+
+Calls Gemini every INTERVAL seconds with a screenshot and returns a
+structured instruction dict. Between API calls, returns the cached result.
+
+Public interface:
+    GeminiPlanner.tick(frame: np.ndarray) -> dict
+        Returns {"instruction": str, "confidence": float, "reason": str}
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from io import BytesIO
+from typing import Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You are the high-level planner for an autonomous Roblox obby agent.\n"
+    "Camera: third-person, fixed forward angle, pitched 20-30° below horizontal.\n"
+    "The character is navigating circular platforms over a void.\n\n"
+    "Your job: look at the screenshot and return a single JSON object with:\n"
+    '  "instruction": one of ["forward", "left", "right", "jump", "forward_jump", "idle"]\n'
+    '  "confidence": float 0.0-1.0\n'
+    '  "reason": one sentence explaining your choice\n\n'
+    "Respond with only valid JSON. No markdown, no explanation outside the JSON."
+)
+
+
+class GeminiPlanner:
+    """
+    High-level planner using Gemini Vision.
+
+    Calls the Gemini API at most once every INTERVAL seconds.
+    Between calls, returns the cached last result.
+    """
+
+    VALID_INSTRUCTIONS = {"forward", "left", "right", "jump", "forward_jump", "idle"}
+    INTERVAL = 1.5  # seconds between API calls
+
+    def __init__(self) -> None:
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            log.warning("GEMINI_API_KEY not set — GeminiPlanner will return idle")
+
+        from google import genai
+        self._client = genai.Client(api_key=api_key) if api_key else None
+
+        self._last_call: float = 0.0
+        self._cached: dict = {
+            "instruction": "idle",
+            "confidence": 0.0,
+            "reason": "init",
+        }
+
+        log.info("GeminiPlanner ready (interval=%.1fs)", self.INTERVAL)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def tick(self, frame: np.ndarray) -> dict:
+        """
+        Return a planning decision for the given BGR frame.
+
+        Uses cached result if called within INTERVAL seconds of the last
+        API call. Otherwise calls Gemini and updates the cache.
+        """
+        now = time.time()
+        if now - self._last_call < self.INTERVAL:
+            return self._cached
+
+        result = self._call_gemini(frame)
+        self._cached = result
+        self._last_call = now
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _call_gemini(self, frame: np.ndarray) -> dict:
+        """Call Gemini Vision with the frame. Returns result dict."""
+        if self._client is None:
+            log.warning("No Gemini client (API key missing) — returning cached")
+            return self._cached
+
+        try:
+            from google import genai  # noqa: F401 (ensure import)
+            from google.genai import types
+
+            # BGR → RGB → JPEG bytes
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            buf = BytesIO()
+            pil_img.save(buf, format="JPEG", quality=85)
+            jpeg_bytes = buf.getvalue()
+
+            image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+
+            response = self._client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[image_part],
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    temperature=0.2,
+                    max_output_tokens=300,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            raw_text = response.text.strip()
+            parsed = json.loads(raw_text)
+
+            instruction = str(parsed.get("instruction", "idle")).lower()
+            if instruction not in self.VALID_INSTRUCTIONS:
+                log.warning(
+                    "Gemini returned invalid instruction %r — using idle", instruction
+                )
+                instruction = "idle"
+
+            confidence = float(parsed.get("confidence", 0.0))
+            confidence = max(0.0, min(1.0, confidence))
+
+            reason = str(parsed.get("reason", "")).strip()
+
+            result = {
+                "instruction": instruction,
+                "confidence": confidence,
+                "reason": reason,
+            }
+            log.info(
+                "Gemini: instruction=%s confidence=%.2f reason=%s",
+                instruction,
+                confidence,
+                reason,
+            )
+            return result
+
+        except Exception:
+            log.warning("Gemini call failed — returning cached", exc_info=True)
+            return self._cached
