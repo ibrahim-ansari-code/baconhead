@@ -156,7 +156,7 @@ def execute_action_ms(action: str, duration_ms: int = 5000) -> None:
     try:
         if look_part and key_parts:
             # look + movement simultaneously: hold keys in main thread, look via Quartz
-            look_ms     = min(duration_ms, 800)
+            look_ms     = min(duration_ms, 3000)
             look_px     = int(LOOK_PX_PER_MS * look_ms)
             look_dx_val = (look_px if look_part == "look_right" else
                            -look_px if look_part == "look_left" else 0)
@@ -175,7 +175,7 @@ def execute_action_ms(action: str, duration_ms: int = 5000) -> None:
             done.set()
             t.join(timeout=0.5)
         elif look_part:
-            look_ms     = min(duration_ms, 800)
+            look_ms     = min(duration_ms, 3000)
             look_px     = int(LOOK_PX_PER_MS * look_ms)
             look_dx_val = (look_px if look_part == "look_right" else
                            -look_px if look_part == "look_left" else 0)

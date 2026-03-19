@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-Idle takeover: when the user stops playing, Scout plans the next 10 seconds and the bot
-executes them. Optionally scores competing plans with the outcome model.
+Idle takeover — single-action-per-Claude-call loop.
 
-Single execution path:
-  1. Wait for idle.
-  2. Capture frame.
-  3. Call plan_next_10s (Scout / Llama-4 vision) → list of (action, ms).
-  4. If outcome_model loaded: generate 2 variant plans and pick the one with highest P(survived).
-  5. Execute the plan step-by-step, focusing Roblox before every look action.
-  6. Resume watching when user becomes active again.
+When the user goes idle, the bot:
+  1. Captures a fresh screenshot every action cycle.
+  2. Computes situation signals: phase, water/void ahead, optical flow,
+     edge distances, stuck count, disaster warning, recent actions.
+  3. Passes all signals as rich text context to Claude alongside the screenshot.
+  4. Claude returns ONE action. Execute it (~300-600ms). Repeat.
+  5. Stops the moment the user presses any key.
 
 Usage:
-    python run_takeover.py --idle 3
-    python run_takeover.py --idle 3 --outcome-model outcome_model.pt
+    python run_takeover.py --idle 3 --game nds
+    python run_takeover.py --idle 3 --game nds --monitor bot_log.tsv
 """
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -33,144 +31,159 @@ load_dotenv()
 from capture.screen import capture_region, get_roblox_region, focus_roblox_and_click
 from reward.input_state import start_listener, is_active, get_recent_activity_summary
 from llm_agent.cem import execute_action_ms
-from llm_agent.scout import plan_next_10s, _default_plan_10s
+from llm_agent.scout import plan_one_action, _default_plan_10s
 
 
-def _compute_spatial(frame: np.ndarray, prev_frame: Optional[np.ndarray]):
-    """Return (edge_distances (4,), flow_mean float) from a frame pair."""
+# ── window focus check ─────────────────────────────────────────────────────────
+
+def _is_roblox_focused() -> bool:
+    """Return True if Roblox is currently the frontmost application."""
     try:
-        from reward.collect_episodes import compute_edge_distances, compute_flow_features, N_BUCKETS
+        import subprocess
+        out = subprocess.run(
+            ["osascript", "-e", "name of (info for (path to frontmost application))"],
+            capture_output=True, text=True, timeout=1,
+        )
+        return "roblox" in (out.stdout or "").lower()
+    except Exception:
+        return False
+
+
+# ── context builder ────────────────────────────────────────────────────────────
+
+def _build_context(
+    frame: np.ndarray,
+    prev_frame: Optional[np.ndarray],
+    last_actions: List[str],
+    stuck_count: int,
+) -> Tuple[str, float]:
+    """
+    Compute all situation signals from the current frame and return:
+      (context_text: str, flow_mean: float)
+
+    context_text is injected into the Claude prompt alongside the screenshot.
+    flow_mean is returned so the caller can track stuck state over time.
+    """
+    lines = []
+    h, w = frame.shape[:2]
+
+    # ── 1. Phase detection ────────────────────────────────────────────────────
+    top_strip = frame[:max(1, int(h * 0.08)), :]
+    red_pct   = float(
+        ((top_strip[..., 0].astype(int) > 150) &
+         (top_strip[..., 1].astype(int) < 80)  &
+         (top_strip[..., 2].astype(int) < 80)).mean()
+    )
+    mean_bright = float(frame.mean())
+    screen_std  = float(frame.std())
+
+    if red_pct > 0.04:
+        lines.append("PHASE: active_round")
+        lines.append("DISASTER WARNING IS ACTIVE — survival is the immediate priority")
+    elif mean_bright > 210 and screen_std < 25:
+        lines.append("PHASE: dead (bright white respawn screen — wait for the game to reload)")
+    elif mean_bright < 15:
+        lines.append("PHASE: dead (black screen — loading or just died)")
+    else:
+        lines.append("PHASE: active_round")
+
+    # ── 2. Water / void ahead ─────────────────────────────────────────────────
+    # Sample a horizontal band in the center of the screen at eye-level (35-65% height)
+    band = frame[int(h * 0.35):int(h * 0.65), int(w * 0.2):int(w * 0.8)]
+    r, g, b = band[..., 0].astype(int), band[..., 1].astype(int), band[..., 2].astype(int)
+    water_mask = (b - r > 50) & (b > 140)
+    void_mask  = (r + g + b) < 55
+    danger_pct = float((water_mask | void_mask).mean())
+
+    if danger_pct > 0.30:
+        lines.append(
+            f"DANGER: {int(danger_pct*100)}% of the area directly ahead is water or void. "
+            "Do NOT walk forward — turn first using look_left or look_right."
+        )
+    elif danger_pct > 0.10:
+        lines.append(f"Caution: {int(danger_pct*100)}% water/void visible in forward area — be careful.")
+    else:
+        lines.append(f"Forward area: {int(danger_pct*100)}% water/void (path looks clear).")
+
+    # ── 3. Optical flow / motion ──────────────────────────────────────────────
+    flow_mean = 0.0
+    try:
         import cv2
         from PIL import Image as _Image
-        frame_224 = np.array(_Image.fromarray(frame.astype(np.uint8)).resize((224, 224), _Image.Resampling.LANCZOS))
-        edge_dists = compute_edge_distances(frame_224)
+        sz = (224, 224)
+        frame_sm = np.array(_Image.fromarray(frame.astype(np.uint8)).resize(sz, _Image.Resampling.LANCZOS))
         if prev_frame is not None:
-            prev_224 = np.array(_Image.fromarray(prev_frame.astype(np.uint8)).resize((224, 224), _Image.Resampling.LANCZOS))
-            gray1 = cv2.cvtColor(prev_224, cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(frame_224, cv2.COLOR_RGB2GRAY)
-            flow  = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-            mag   = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+            prev_sm = np.array(_Image.fromarray(prev_frame.astype(np.uint8)).resize(sz, _Image.Resampling.LANCZOS))
+            g1   = cv2.cvtColor(prev_sm, cv2.COLOR_RGB2GRAY)
+            g2   = cv2.cvtColor(frame_sm, cv2.COLOR_RGB2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(g1, g2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag  = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
             flow_mean = float(mag.mean())
-        else:
-            flow_mean = 0.0
-        return edge_dists, flow_mean
-    except Exception:
-        return None, None
-
-
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def click_close(region: Optional[dict]) -> None:
-    """Click the X then the No button when a popup is detected."""
-    if not region:
-        return
-    try:
-        import pyautogui
-        x = region["left"] + region["width"] - 40
-        y = region["top"] + 25
-        pyautogui.click(x, y)
-        time.sleep(0.15)
-        no_x = int(region["left"] + region["width"] * 0.72)
-        no_y = int(region["top"] + region["height"] * 0.65)
-        pyautogui.click(no_x, no_y)
-        time.sleep(0.1)
     except Exception:
         pass
 
+    if flow_mean < 0.3:
+        motion_str = "stationary — character is not moving"
+    elif flow_mean < 1.5:
+        motion_str = f"slow (flow={flow_mean:.1f})"
+    else:
+        motion_str = f"moving well (flow={flow_mean:.1f})"
+    lines.append(f"Motion: {motion_str}")
 
-def _focus_for_look(region: Optional[dict]) -> None:
-    """Ensure the Roblox window is focused and the mouse is inside it before a camera drag."""
+    # ── 4. Stuck counter ──────────────────────────────────────────────────────
+    if stuck_count >= 3:
+        lines.append(
+            f"STUCK: character has not moved for {stuck_count} consecutive cycles. "
+            "You MUST change direction — use look_right or look_left, then W."
+        )
+
+    # ── 5. Platform edge distances ────────────────────────────────────────────
     try:
-        focus_roblox_and_click()
+        from reward.collect_episodes import compute_edge_distances
+        from PIL import Image as _Image
+        frame_sm2 = np.array(_Image.fromarray(frame.astype(np.uint8)).resize((224, 224), _Image.Resampling.LANCZOS))
+        edge_dists = compute_edge_distances(frame_sm2)
+        labels     = ["top", "right", "bottom", "left"]
+        parts      = []
+        for label, dist in zip(labels, edge_dists):
+            pct = int(dist * 100)
+            tag = " (VERY CLOSE)" if pct < 10 else " (close)" if pct < 25 else ""
+            parts.append(f"{label}={pct}%{tag}")
+        lines.append("Platform edges: " + ", ".join(parts))
+        dangers = [l for l, d in zip(labels, edge_dists) if d < 0.12]
+        if dangers:
+            lines.append(f"EDGE DANGER: very close to {'/'.join(dangers)} edge — do not move that direction")
     except Exception:
         pass
 
+    # ── 6. Recent actions ─────────────────────────────────────────────────────
+    if last_actions:
+        lines.append(f"Last {min(6, len(last_actions))} actions: {', '.join(list(last_actions)[-6:])}")
 
-def _is_look_action(action: str) -> bool:
-    return "look_" in action.lower()
-
-
-# ── outcome-model scoring ──────────────────────────────────────────────────────
-
-def _plan_to_key_events(plan: List[Tuple[str, int]]) -> np.ndarray:
-    """
-    Convert a Scout plan [(action, ms), ...] into the key_events array expected by
-    the outcome model (MAX_KEY_EVENTS × 3 float32: [key_idx, t_down_ms, t_up_ms]).
-    """
-    from reward.collect_episodes import KEY_TO_IDX, MAX_KEY_EVENTS, pack_key_events
-    events = []
-    t_cursor = 0.0
-    for action, ms in plan:
-        parts = [p.strip().lower() for p in action.split("+") if p.strip()]
-        for p in parts:
-            key_idx = KEY_TO_IDX.get(p)
-            if key_idx is not None:
-                events.append((key_idx, t_cursor, t_cursor + ms))
-        t_cursor += ms
-    return pack_key_events(events)
+    return "\n".join(lines), flow_mean
 
 
-def _score_plan(
-    plan: List[Tuple[str, int]],
-    frame: np.ndarray,
-    outcome_model,
-    outcome_device,
-    physics: Optional[dict] = None,
-) -> float:
-    """Score a plan with the outcome model. Returns P(survived) in [0, 1]."""
-    from reward.collect_episodes import compute_edge_distances, compute_flow_features, N_BUCKETS
-    import numpy as np
+# ── misc helpers ───────────────────────────────────────────────────────────────
 
-    key_events   = _plan_to_key_events(plan)
-    from PIL import Image as _Image
-    frame_224 = np.array(_Image.fromarray(frame.astype(np.uint8)).resize((224, 224), _Image.Resampling.LANCZOS))
-
-    edge_dists   = compute_edge_distances(frame_224)
-    flow_mag     = np.zeros(N_BUCKETS, dtype=np.float32)
-    flow_dir     = np.zeros(N_BUCKETS, dtype=np.float32)
-
-    return outcome_model.predict_survival(
-        frame_224, edge_dists, flow_mag, flow_dir, key_events,
-        device=outcome_device, physics=physics,
-    )
-
-
-def _variant_plans(base_plan: List[Tuple[str, int]]) -> List[List[Tuple[str, int]]]:
-    """Generate 2 simple variants of a plan for outcome-model comparison."""
+def _default_action() -> Tuple[str, int]:
     import random
-    variants = []
-
-    # Variant 1: shorten all durations by 30%
-    v1 = [(a, max(100, int(ms * 0.7))) for a, ms in base_plan]
-    variants.append(v1)
-
-    # Variant 2: insert a W+space jump after the first W action
-    v2 = list(base_plan)
-    for i, (a, ms) in enumerate(v2):
-        if a.lower() == "w":
-            v2.insert(i + 1, ("W+space", 350))
-            break
-    # Trim if too long
-    variants.append(v2[:len(base_plan) + 1])
-
-    return variants
+    return random.choice([("W", 400), ("look_right", 400), ("W", 500)])
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Idle takeover — Scout plans + optional outcome scoring")
-    parser.add_argument("--idle",          type=float, default=3.0,   help="Idle seconds before takeover")
-    parser.add_argument("--full-screen",   action="store_true",        help="Capture full monitor instead of Roblox window")
-    parser.add_argument("--region",        type=str,   default=None,   help="left,top,width,height")
-    parser.add_argument("--no-scout",      action="store_true",        help="Skip Scout (use default fallback plans)")
-    parser.add_argument("--outcome-model", type=str,   default=None,   help="Path to outcome_model.pt for plan scoring")
-    parser.add_argument("--monitor",       type=str,   default=None,   help="Log decisions to this file")
-    parser.add_argument("--max-step-ms",   type=int,   default=2000,   help="Cap any single action to this many ms")
-    parser.add_argument("--game",          type=str,   default=None,   help="Game name for context-aware planning (e.g. nds, obby)")
+    parser = argparse.ArgumentParser(description="Idle takeover — single-action Claude loop")
+    parser.add_argument("--idle",        type=float, default=3.0,  help="Idle seconds before takeover")
+    parser.add_argument("--full-screen", action="store_true",       help="Capture full monitor")
+    parser.add_argument("--region",      type=str,   default=None,  help="left,top,width,height")
+    parser.add_argument("--no-scout",    action="store_true",       help="Skip Claude (use random fallback)")
+    parser.add_argument("--monitor",     type=str,   default=None,  help="Log decisions to this TSV file")
+    parser.add_argument("--max-step-ms", type=int,   default=800,   help="Cap any single action to this many ms")
+    parser.add_argument("--game",        type=str,   default=None,  help="Game context: nds | obby | brookhaven")
     args = parser.parse_args()
 
-    # ── region ──────────────────────────────────────────────────────────────────
+    # ── region ────────────────────────────────────────────────────────────────
     region = None
     if args.region:
         parts = [int(x.strip()) for x in args.region.split(",")]
@@ -192,216 +205,116 @@ def main():
                 print("Waiting for Roblox window... (Ctrl+C to abort)", flush=True)
             time.sleep(3)
         if region is None:
-            print("Error: Roblox window not found after 90s. Use --region or --full-screen.", file=sys.stderr)
+            print("Error: Roblox window not found. Use --region or --full-screen.", file=sys.stderr)
             sys.exit(1)
         print("Using Roblox window:", region, flush=True)
 
-    # ── api key ──────────────────────────────────────────────────────────────────
+    # ── api key ───────────────────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not args.no_scout and not api_key:
-        print("Warning: ANTHROPIC_API_KEY not set; Scout will be skipped.", file=sys.stderr)
+        print("Warning: ANTHROPIC_API_KEY not set; using random fallback actions.", file=sys.stderr)
 
-    # ── outcome model ────────────────────────────────────────────────────────────
-    outcome_model  = None
-    outcome_device = None
-    physics        = None
-    if args.outcome_model and os.path.isfile(args.outcome_model):
-        import torch
-        from reward.outcome_model import load_outcome_model
-        outcome_device = torch.device(
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
-            else "cpu"
-        )
-        outcome_model = load_outcome_model(args.outcome_model, device=outcome_device)
-        print(f"Loaded outcome model from {args.outcome_model}", flush=True)
-        physics_path = os.path.join("episode_data", "physics.json")
-        if os.path.isfile(physics_path):
-            with open(physics_path) as f:
-                physics = json.load(f)
-            print(f"Loaded physics from {physics_path}", flush=True)
-    elif args.outcome_model:
-        print(f"Warning: --outcome-model path not found: {args.outcome_model}", file=sys.stderr)
-
-    # ── misc setup ───────────────────────────────────────────────────────────────
+    # ── setup ─────────────────────────────────────────────────────────────────
     start_listener()
-    sct           = mss.mss()
-    idle_sec      = args.idle
-    max_step_ms   = max(1, args.max_step_ms)
-    monitor_path  = args.monitor
-    game_name     = (args.game or "").strip().lower()
-    n_actions     = 0
-    last_bot_time = [0.0]
-    BOT_COOLDOWN  = 3.0    # ignore "user active" for this long after a bot key press (pyautogui keys trip pynput)
+    sct          = mss.mss()
+    idle_sec     = args.idle
+    max_step_ms  = max(100, args.max_step_ms)
+    monitor_path = args.monitor
+    game_name    = (args.game or "").strip().lower()
+    use_scout    = not args.no_scout and bool(api_key)
 
-    last_actions:     deque = deque(maxlen=20)
-    last_objective:   Optional[str] = None
-    idle_since        = [None]
-    current_plan:     List[Tuple[str, int]] = []
-    plan_index        = 0
-    precomputed_plan: Optional[List[Tuple[str, int]]] = None
-    precomputed_obj:  Optional[str] = None
-    precomputed_popup = False
-    look_streak       = [0]   # consecutive look_left/look_right actions
+    BOT_COOLDOWN  = 3.0   # seconds to ignore user-active after bot action (pyautogui trips pynput)
+    last_bot_time = [0.0]
+    bot_active    = [False]
+
+    last_actions: deque = deque(maxlen=20)
+    prev_frame:   Optional[np.ndarray] = None
+
+    # Rolling flow_mean window for stuck detection
+    flow_window:  deque = deque(maxlen=5)
+    stuck_count   = [0]
 
     def log(msg: str):
         print(msg, flush=True)
 
-    def monitor_log(action: str, ms: int, source: str = "scout"):
+    def monitor_log(action: str, ms: int):
         if not monitor_path:
             return
         try:
             with open(monitor_path, "a") as f:
-                f.write(f"{time.time():.3f}\t{source}\t{action}\t{ms}\n")
+                f.write(f"{time.time():.3f}\t{action}\t{ms}\n")
         except Exception:
             pass
 
-    def need_plan() -> bool:
-        return plan_index >= len(current_plan)
-
-    def remaining_plan() -> List[Tuple[str, int]]:
-        return current_plan[plan_index:] if plan_index < len(current_plan) else []
-
-    use_scout = not args.no_scout and bool(api_key)
-
-    log(f"Watching. Takeover after {idle_sec}s idle. Scout={'on' if use_scout else 'off'} OutcomeModel={'on' if outcome_model else 'off'}.")
+    log(f"Watching. Takeover after {idle_sec}s idle. Scout={'on' if use_scout else 'off (random)'}.")
     log("Press Ctrl+C to stop.")
-
-    prev_frame: Optional[np.ndarray] = None
 
     try:
         while True:
-            time.sleep(0.25)   # poll at 4 Hz — prevents busy-spin and CPU overload
+            time.sleep(0.15)   # ~6 Hz polling — responsive but not CPU-intensive
             frame = capture_region(region=region, sct=sct)
             now   = time.perf_counter()
-            edge_dists, flow_mean = _compute_spatial(frame, prev_frame)
-            prev_frame = frame
 
-            # ── user active? ──────────────────────────────────────────────────
+            # ── user active check ─────────────────────────────────────────────
             in_cooldown = (now - last_bot_time[0]) < BOT_COOLDOWN
             if not in_cooldown and is_active(idle_sec):
-                if idle_since[0] is not None:
+                if bot_active[0]:
                     log("[takeover] User active — stopping bot.")
-                idle_since[0]    = None
-                current_plan     = []
-                plan_index       = 0
-                precomputed_plan = None
-                look_streak[0]   = 0
+                    bot_active[0]   = False
+                    stuck_count[0]  = 0
+                    flow_window.clear()
+                prev_frame = frame
                 continue
 
-            if idle_since[0] is None:
-                idle_since[0] = time.perf_counter()
+            if not bot_active[0]:
+                bot_active[0] = True
                 log("[takeover] Idle — starting takeover.")
 
-            # ── acquire plan ──────────────────────────────────────────────────
-            if need_plan():
-                if precomputed_plan is not None and not precomputed_popup:
-                    current_plan     = precomputed_plan
-                    plan_index       = 0
-                    if precomputed_obj:
-                        last_objective = precomputed_obj
-                    precomputed_plan = None
-                    precomputed_obj  = None
-                    log("[takeover] Using precomputed plan.")
-                else:
-                    if precomputed_popup:
-                        log("[takeover] Popup in precomputed plan — clicking close.")
-                        click_close(region)
-                        time.sleep(0.3)
-                        precomputed_plan  = None
-                        precomputed_popup = False
+            # ── build situation context ───────────────────────────────────────
+            context_text, flow_mean = _build_context(
+                frame, prev_frame, list(last_actions), stuck_count[0]
+            )
+            prev_frame = frame
 
-                    if use_scout:
-                        user_pattern = get_recent_activity_summary(seconds=120.0) or None
-                        consecutive_looks = look_streak[0]
-                        plan, objectives, popup = plan_next_10s(
-                            frame,
-                            api_key=api_key,
-                            current_plan_remaining=remaining_plan(),
-                            executed_recent=list(last_actions),
-                            user_pattern=user_pattern,
-                            last_objective=last_objective,
-                            look_streak=consecutive_looks,
-                            edge_distances=edge_dists,
-                            flow_mean=flow_mean,
-                            game=game_name,
-                        )
-                        if popup:
-                            log("[takeover] Popup detected — clicking close.")
-                            click_close(region)
-                            time.sleep(0.3)
-                            continue
-                        if objectives:
-                            last_objective = objectives
-                    else:
-                        plan = _default_plan_10s()
-
-                    # ── outcome scoring: log only, don't override Claude's plan ──
-                    # Outcome model trained on NDS data — scoring is informational until
-                    # we have enough game-specific data to trust its plan selection.
-                    if outcome_model is not None and plan:
-                        try:
-                            base_score = _score_plan(plan, frame, outcome_model, outcome_device, physics)
-                            log(f"[takeover] Outcome model P(survived)={base_score:.2f} (informational)")
-                        except Exception:
-                            pass
-
-                    current_plan = plan
-                    plan_index   = 0
-                    look_streak[0] = 0
-                    precomputed_plan = None
-
-            if need_plan():
-                time.sleep(0.3)
-                continue
-
-            # ── execute next action ───────────────────────────────────────────
-            action, action_ms = current_plan[plan_index]
-            action_ms = min(max(1, action_ms), max_step_ms)
-            n_actions += 1
-
-            # Focus Roblox before every look (camera drag requires window focus + mouse inside)
-            if _is_look_action(action):
-                _focus_for_look(region)
-                look_streak[0] += 1
-            elif n_actions % 8 == 1:
-                if focus_roblox_and_click():
-                    log("[takeover] Refocused Roblox.")
-                look_streak[0] = 0
+            # ── update stuck counter ──────────────────────────────────────────
+            flow_window.append(flow_mean)
+            if len(flow_window) >= 4 and (sum(flow_window) / len(flow_window)) < 0.35:
+                stuck_count[0] += 1
             else:
-                look_streak[0] = 0
+                stuck_count[0] = 0
 
-            log(f"[takeover] step {plan_index + 1}/{len(current_plan)} | {action!r} {action_ms} ms")
+            # ── get one action from Claude ────────────────────────────────────
+            if use_scout:
+                action, action_ms = plan_one_action(
+                    frame,
+                    context_text=context_text,
+                    api_key=api_key,
+                    game=game_name,
+                )
+            else:
+                action, action_ms = _default_action()
+
+            # Look actions have their own internal cap (degrees → ms via _degrees_to_ms),
+            # so don't apply max_step_ms to them — it would truncate large turns.
+            is_look = "look_" in action.lower()
+            if is_look:
+                action_ms = max(100, action_ms)
+            else:
+                action_ms = min(max(100, action_ms), max_step_ms)
+
+            # ── ensure Roblox is focused before every action ──────────────────
+            if not _is_roblox_focused():
+                log("[takeover] Roblox not focused — focusing...")
+                focus_roblox_and_click()
+                time.sleep(0.2)
+
+            # ── execute ───────────────────────────────────────────────────────
+            first_context_line = context_text.splitlines()[0] if context_text else ""
+            log(f"[takeover] {action!r} {action_ms}ms | {first_context_line}")
             monitor_log(action, action_ms)
             execute_action_ms(action, duration_ms=action_ms)
             last_bot_time[0] = time.perf_counter()
             last_actions.append(action)
-            plan_index += 1
-
-            # ── precompute next plan when near the end ────────────────────────
-            if (plan_index >= len(current_plan) - 3
-                    and len(current_plan) > 0
-                    and precomputed_plan is None
-                    and use_scout):
-                next_frame    = capture_region(region=region, sct=sct)
-                user_pattern  = get_recent_activity_summary(seconds=120.0) or None
-                next_edge_dists, next_flow_mean = _compute_spatial(next_frame, frame)
-                next_plan, next_obj, next_popup = plan_next_10s(
-                    next_frame,
-                    api_key=api_key,
-                    current_plan_remaining=current_plan[plan_index:],
-                    executed_recent=list(last_actions),
-                    user_pattern=user_pattern,
-                    last_objective=last_objective,
-                    look_streak=look_streak[0],
-                    edge_distances=next_edge_dists,
-                    flow_mean=next_flow_mean,
-                    game=game_name,
-                )
-                precomputed_plan  = next_plan
-                precomputed_obj   = next_obj
-                precomputed_popup = next_popup
-                log("[takeover] Precomputed next 10s plan.")
 
     except KeyboardInterrupt:
         pass
