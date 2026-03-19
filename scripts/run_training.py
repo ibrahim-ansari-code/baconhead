@@ -53,6 +53,10 @@ def main() -> None:
         "--resume", type=str, default=None,
         help="Path to saved model .zip to resume training",
     )
+    parser.add_argument(
+        "--bc-checkpoint", type=str, default=None,
+        help="Path to BC checkpoint for warm-start (auto-detects checkpoints/bc_best.pt)",
+    )
     args = parser.parse_args()
 
     cfg = load_training_config()
@@ -74,18 +78,36 @@ def main() -> None:
         log.info("Resuming from %s", args.resume)
         model = PPO.load(args.resume, env=env)
     else:
+        # Detect BC checkpoint for warm-start
+        bc_cp = args.bc_checkpoint or (
+            "checkpoints/bc_best.pt" if Path("checkpoints/bc_best.pt").exists() else None
+        )
+
+        # Use lower LR and fewer epochs when warm-starting from BC
+        lr = cfg.get("bc_learning_rate", cfg.get("learning_rate", 2.5e-4)) if bc_cp else cfg.get("learning_rate", 2.5e-4)
+        n_epochs = cfg.get("bc_n_epochs", cfg.get("n_epochs", 4)) if bc_cp else cfg.get("n_epochs", 4)
+
         model = PPO(
             policy="CnnPolicy",
             env=env,
-            learning_rate=cfg.get("learning_rate", 2.5e-4),
+            learning_rate=lr,
             n_steps=cfg.get("n_steps", 128),
             batch_size=cfg.get("batch_size", 32),
-            n_epochs=cfg.get("n_epochs", 4),
+            n_epochs=n_epochs,
             gamma=cfg.get("gamma", 0.99),
             clip_range=cfg.get("clip_range", 0.1),
             verbose=1,
             tensorboard_log="logs/tensorboard/",
         )
+
+        if bc_cp:
+            from training.bc_weight_transfer import transfer_bc_to_ppo
+            result = transfer_bc_to_ppo(bc_cp, model)
+            log.info(
+                "BC transfer: %d keys transferred. val_acc=%.1f%%",
+                len(result["transferred_keys"]),
+                result["bc_metadata"].get("val_accuracy", 0) * 100,
+            )
 
     log.info("Starting PPO training for %d timesteps", total_timesteps)
 
@@ -118,6 +140,12 @@ def main() -> None:
     save_path = checkpoint_dir / "obby_ppo.zip"
     model.save(str(save_path))
     log.info("Model saved to %s", save_path)
+
+    # Export PPO weights back to BC format for TwoTierAgent
+    if cfg.get("export_to_bc", True):
+        from training.bc_weight_transfer import export_ppo_to_bc
+        export_ppo_to_bc(model, "checkpoints/bc_best.pt", {"epoch": "ppo"})
+        log.info("PPO weights exported to bc_best.pt")
 
 
 if __name__ == "__main__":

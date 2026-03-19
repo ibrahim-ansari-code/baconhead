@@ -1,0 +1,6 @@
+{
+  "source": "self_play",
+  "num_frames": 367,
+  "stage_advances": 2,
+  "final_stage": 32
+}

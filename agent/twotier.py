@@ -1,9 +1,7 @@
 """
-agent/twotier.py — Two-tier agent: Gemini planner + CNN controller.
+agent/twotier.py — CNN-only agent controller.
 
-Gemini provides high-level instructions every 1.5s.
 The CNN produces actions at ~20fps from stacked frames.
-Planner instructions bias the CNN logits before argmax.
 
 Public interface:
     TwoTierAgent.run(duration_seconds, dry_run) -> None
@@ -22,7 +20,6 @@ import numpy as np
 import torch
 import yaml
 
-from agent.planner import GeminiPlanner
 from capture.screen import Capturer
 from control.actions import (
     ACTION_NAMES,
@@ -47,18 +44,16 @@ def _load_twotier_config() -> dict:
 
 class TwoTierAgent:
     """
-    Two-tier agent combining a Gemini high-level planner with a CNN controller.
+    CNN-only agent controller.
 
-    The CNN runs at ~20fps producing action logits. The planner's cached
-    instruction biases those logits before argmax.
+    The CNN runs at ~20fps producing action logits.
     """
 
     def __init__(
         self,
         capturer: Capturer,
         checkpoint_path: str | None = None,
-        bias_scale: float | None = None,
-        use_gemini: bool = True,
+        enable_self_improvement: bool = False,
     ) -> None:
         cfg = _load_twotier_config()
 
@@ -70,7 +65,6 @@ class TwoTierAgent:
         self._respawn_wait: float = cfg.get("respawn_wait", 3.0)
         self._respawn_timeout: float = cfg.get("respawn_timeout", 10.0)
         self._respawn_void_threshold: float = cfg.get("respawn_void_threshold", 0.3)
-        self._bias_scale: float = bias_scale if bias_scale is not None else cfg.get("bias_scale", 2.0)
 
         # CNN — default path is same file that scripts/train_bc.py saves (bc_best.pt)
         _default_cp = cfg.get("checkpoint", "checkpoints/bc_best.pt")
@@ -86,24 +80,39 @@ class TwoTierAgent:
             self._model.load_state_dict(state)
         self._model.to(self._device)
         self._model.eval()
+        self._model_lock = threading.RLock()
         log.info("CNN loaded from %s on %s", cp, self._device)
 
         # Frame stacker
         self._stacker = FrameStacker(stack_size=4)
 
-        # Planner
-        self._planner: GeminiPlanner | None = None
-        self._planner_result: dict = {"instruction": "idle", "confidence": 0.0, "reason": "init"}
-        self._planner_lock = threading.Lock()
-        if use_gemini:
-            self._planner = GeminiPlanner()
-            t = threading.Thread(target=self._planner_loop, daemon=True)
-            t.start()
+        # Death tracking
+        self._deaths: int = 0
 
-        # Build instruction → action index map
-        self._instruction_to_idx: dict[str, int] = {
-            name: idx for idx, name in enumerate(ACTION_NAMES)
-        }
+        # Self-improvement components
+        self._self_improvement = enable_self_improvement
+        self._recorder = None
+        self._retrainer = None
+        self._reward_calc = None
+        self._episode_reward: float = 0.0
+        self._progress_estimator = None
+        self._latest_progress: float | None = None
+        self._progress_frame_count: int = 0
+        self._progress_every_n: int = cfg.get("progress_every_n_frames", 40)
+        if enable_self_improvement:
+            from training.reward import RewardCalculator
+            self._reward_calc = RewardCalculator()
+            from agent.progress_estimator import GeminiProgressEstimator
+            self._progress_estimator = GeminiProgressEstimator()
+        if enable_self_improvement:
+            from agent.experience_recorder import ExperienceRecorder
+            from agent.background_retrainer import BackgroundRetrainer
+            self._recorder = ExperienceRecorder(demos_dir="demos")
+            self._retrainer = BackgroundRetrainer(demos_dir="demos", checkpoint_dir="checkpoints")
+            self._retrainer.start()
+            t = threading.Thread(target=self._hotswap_loop, daemon=True)
+            t.start()
+            log.info("Self-improvement enabled: recorder + retrainer + hot-swap")
 
     # ------------------------------------------------------------------
     # Public
@@ -117,8 +126,8 @@ class TwoTierAgent:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
         log.info(
-            "Starting two-tier agent — duration=%ds fps=%d dry_run=%s gemini=%s",
-            duration_seconds, self._fps, dry_run, self._planner is not None,
+            "Starting CNN agent — duration=%ds fps=%d dry_run=%s",
+            duration_seconds, self._fps, dry_run,
         )
 
         # One-time camera setup
@@ -132,9 +141,13 @@ class TwoTierAgent:
         processed = preprocess_frame(frame)
         self._stacker.reset(processed)
 
+        if self._reward_calc is not None:
+            pass  # RewardCalculator is stateless; nothing to reset
+        self._episode_reward = 0.0
+
         start = time.monotonic()
         frame_count = 0
-        deaths = 0
+        prev_stage: int | None = None
 
         try:
             while time.monotonic() - start < duration_seconds:
@@ -148,10 +161,24 @@ class TwoTierAgent:
 
                 # 2. Death check
                 if self._capturer.death_event:
-                    deaths += 1
-                    log.info("Death #%d at frame %d", deaths, frame_count)
+                    self._deaths += 1
+                    if self._reward_calc is not None:
+                        step_reward = self._reward_calc.compute(
+                            progress=None, death_event=True, stuck=False
+                        )
+                        self._episode_reward += step_reward
+                        self._latest_progress = None
+                        log.info(
+                            "Death #%d at frame %d — step_reward=%.4f episode_reward=%.4f",
+                            self._deaths, frame_count, step_reward, self._episode_reward,
+                        )
+                    else:
+                        log.info("Death #%d at frame %d", self._deaths, frame_count)
+                    if self._recorder is not None:
+                        self._recorder.on_death()
                     if not dry_run:
                         self._handle_death()
+                    self._episode_reward = 0.0
                     frame_count += 1
                     continue
 
@@ -163,18 +190,8 @@ class TwoTierAgent:
                 # 4. CNN inference
                 logits = self._cnn_inference(stacked)
 
-                # 5. Planner bias (non-blocking — reads from background thread)
-                planner_result = None
-                if self._planner is not None:
-                    with self._planner_lock:
-                        planner_result = self._planner_result
-
-                if planner_result is not None:
-                    logits = self._bias_logits(logits, planner_result)
-
-                # 6. Select and execute action
+                # 5. Select action
                 action = int(np.argmax(logits))
-
                 # Idle suppression: if CNN picks idle, fall back to best non-idle action
                 if action == 5:
                     non_idle_logits = logits.copy()
@@ -193,6 +210,39 @@ class TwoTierAgent:
                 if not dry_run:
                     begin_action(action)
 
+                # Progress estimation (rate-limited Gemini call)
+                if self._progress_estimator is not None:
+                    self._progress_frame_count += 1
+                    if self._progress_frame_count % self._progress_every_n == 0:
+                        prev_progress = self._latest_progress
+                        self._latest_progress = self._progress_estimator.estimate(frame)
+                        log.info(
+                            "Frame %d: Gemini progress=%.3f (prev=%.3f)",
+                            frame_count,
+                            self._latest_progress if self._latest_progress is not None else -1.0,
+                            prev_progress if prev_progress is not None else -1.0,
+                        )
+
+                # Reward tracking
+                if self._reward_calc is not None:
+                    step_reward = self._reward_calc.compute(
+                        progress=self._latest_progress, death_event=False, stuck=False
+                    )
+                    self._episode_reward += step_reward
+                    if frame_count % 20 == 0:
+                        log.info(
+                            "Frame %d: step_reward=%.4f episode_reward=%.4f",
+                            frame_count, step_reward, self._episode_reward,
+                        )
+
+                # Self-improvement: record frame and detect stage advances
+                if self._recorder is not None:
+                    curr_stage = self._capturer.current_stage
+                    self._recorder.record(self._capturer.last_frame, action, curr_stage)
+                    if prev_stage is not None and curr_stage > prev_stage:
+                        self._recorder.on_stage_advance(curr_stage)
+                    prev_stage = curr_stage
+
                 frame_count += 1
 
                 # 7. Frame rate sleep
@@ -202,28 +252,45 @@ class TwoTierAgent:
                     time.sleep(remaining)
 
         finally:
+            # Flush self-demo data if quality threshold met
+            if self._recorder is not None:
+                run_path = self._recorder.flush_run()
+                if run_path is not None and self._retrainer is not None:
+                    self._retrainer.notify_new_run(run_path)
+            if self._retrainer is not None:
+                self._retrainer.stop()
             self._cleanup()
 
         elapsed_total = time.monotonic() - start
         log.info(
             "Agent stopped — %d frames in %.1fs (%.1f fps), %d deaths",
             frame_count, elapsed_total,
-            frame_count / max(elapsed_total, 0.001), deaths,
+            frame_count / max(elapsed_total, 0.001), self._deaths,
         )
+        if self._reward_calc is not None:
+            log.info("Final cumulative episode reward: %.4f", self._episode_reward)
 
     # ------------------------------------------------------------------
-    # Background planner thread
+    # Hot-swap loop (self-improvement)
     # ------------------------------------------------------------------
 
-    def _planner_loop(self) -> None:
-        """Daemon thread: calls Gemini every INTERVAL seconds without blocking the main loop."""
+    def _hotswap_loop(self) -> None:
+        """Daemon thread: polls for bc_pending.flag and hot-swaps model weights."""
+        flag = Path("checkpoints/bc_pending.flag")
         while True:
-            frame = self._capturer.last_frame
-            if frame is not None:
-                result = self._planner._call_gemini(frame)
-                with self._planner_lock:
-                    self._planner_result = result
-            time.sleep(self._planner.INTERVAL)
+            time.sleep(30)
+            if flag.exists():
+                try:
+                    new_cp = flag.read_text().strip() or "checkpoints/bc_best.pt"
+                    state = torch.load(new_cp, map_location=self._device, weights_only=False)
+                    sd = state.get("model_state_dict", state)
+                    with self._model_lock:
+                        self._model.load_state_dict(sd)
+                        self._model.eval()
+                    flag.unlink()
+                    log.info("Hot-swapped model from %s", new_cp)
+                except Exception:
+                    log.exception("Hot-swap failed")
 
     # ------------------------------------------------------------------
     # Death / respawn
@@ -266,27 +333,16 @@ class TwoTierAgent:
         self._stacker.reset(processed)
 
     # ------------------------------------------------------------------
-    # CNN + bias
+    # CNN inference
     # ------------------------------------------------------------------
 
     def _cnn_inference(self, stacked: np.ndarray) -> np.ndarray:
         """Run CNN forward pass. Returns logits as numpy array of shape (6,)."""
         tensor = torch.from_numpy(stacked).unsqueeze(0).to(self._device)
-        with torch.no_grad():
-            logits = self._model(tensor)
+        with self._model_lock:
+            with torch.no_grad():
+                logits = self._model(tensor)
         return logits.squeeze(0).cpu().numpy()
-
-    def _bias_logits(self, logits: np.ndarray, planner_result: dict) -> np.ndarray:
-        """Add planner bias to the CNN logits."""
-        instruction = planner_result.get("instruction", "idle")
-        confidence = planner_result.get("confidence", 0.0)
-
-        idx = self._instruction_to_idx.get(instruction)
-        if idx is not None:
-            logits = logits.copy()
-            logits[idx] += self._bias_scale * confidence
-
-        return logits
 
     # ------------------------------------------------------------------
     # Cleanup

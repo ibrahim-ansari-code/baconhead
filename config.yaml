@@ -68,6 +68,9 @@ twotier:
   ocr_every_n_frames: 10
   checkpoint: "checkpoints/bc_best.pt"
   uncertainty_threshold: 0.5
+  gemini_override_threshold: 0.65
+  gemini_commit_frames: 10
+  progress_every_n_frames: 40   # Gemini progress call interval (2s at 20fps)
 
 training:
   # Seconds without stage progress before stuck detection fires.
@@ -83,3 +86,10 @@ training:
   n_epochs: 4
   gamma: 0.99
   clip_range: 0.1
+
+  # BC warm-start hyperparameters (used when bc_best.pt detected)
+  bc_learning_rate: 1.0e-4
+  bc_n_epochs: 3
+
+  # Export PPO weights to bc_best.pt at end of training
+  export_to_bc: true

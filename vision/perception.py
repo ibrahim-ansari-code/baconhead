@@ -62,6 +62,34 @@ def _compute_directional_bias(mask: np.ndarray) -> tuple[float, float, str]:
     return platform_left, platform_right, bias
 
 
+def estimate_character_y(frame_bgr: np.ndarray) -> float | None:
+    """
+    Estimate the character's normalized Y position from a BGR frame.
+
+    Looks for dark pixels (V < 60 in HSV) in a center crop of the frame,
+    which correspond to the character's dark clothing.
+
+    Returns a value in [0.0, 1.0] where 0.0 = top of frame (furthest along
+    course) and 1.0 = bottom of frame (start). Returns None if fewer than
+    20 dark pixels are found (noise rejection).
+    """
+    h, w = frame_bgr.shape[:2]
+    r0, r1 = int(h * 0.15), int(h * 0.90)
+    c0, c1 = int(w * 0.25), int(w * 0.75)
+    crop = frame_bgr[r0:r1, c0:c1]
+
+    crop_hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    dark_mask = cv2.inRange(crop_hsv, np.array([0, 0, 0], dtype=np.uint8), np.array([180, 255, 60], dtype=np.uint8))
+
+    ys = np.where(dark_mask > 0)[0]
+    if len(ys) < 20:
+        return None
+
+    centroid_y_in_crop = float(np.mean(ys))
+    centroid_y_in_frame = centroid_y_in_crop + r0
+    return centroid_y_in_frame / h
+
+
 def compute_scene_state(
     frame_bgr: np.ndarray,
     void_hsv_lower: np.ndarray,

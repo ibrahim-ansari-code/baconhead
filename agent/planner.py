@@ -30,12 +30,18 @@ log = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You are the high-level planner for an autonomous Roblox obby agent.\n"
-    "Camera: third-person, fixed forward angle, pitched 20-30° below horizontal.\n"
+    "Camera: third-person, fixed forward angle, pitched 25° below horizontal. The camera does NOT rotate — it is locked.\n"
     "The character is navigating circular platforms over a void.\n\n"
-    "Your job: look at the screenshot and return a single JSON object with:\n"
+    "Your job: look at the screenshot, identify the next visible platform or checkpoint ahead, and return a single JSON object with:\n"
     '  "instruction": one of ["forward", "left", "right", "jump", "forward_jump", "idle"]\n'
     '  "confidence": float 0.0-1.0\n'
     '  "reason": one sentence explaining your choice\n\n'
+    "Decision rules:\n"
+    "- Default to 'forward' or 'forward_jump' to make progress toward the next platform.\n"
+    "- Use 'left' or 'right' only when the path clearly curves or the next platform is off to the side.\n"
+    "- Use 'jump' or 'forward_jump' when there is a gap to cross.\n"
+    "- Use 'idle' only if no safe move is apparent (e.g. character is mid-air with no platform visible).\n"
+    "- Prefer action with confidence >= 0.65 so the agent can act decisively.\n\n"
     "Respond with only valid JSON. No markdown, no explanation outside the JSON."
 )
 
@@ -95,7 +101,13 @@ class GeminiPlanner:
     # Internal
     # ------------------------------------------------------------------
 
-    def _call_gemini(self, frame: np.ndarray) -> dict:
+    def _call_gemini(
+        self,
+        frame: np.ndarray,
+        stage: Optional[int] = None,
+        just_died: bool = False,
+        death_count: int = 0,
+    ) -> dict:
         """Call Gemini Vision with the frame. Returns result dict."""
         if self._client is None:
             log.warning("No Gemini client (API key missing) — returning cached")
@@ -114,9 +126,21 @@ class GeminiPlanner:
 
             image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
 
+            # Build context prefix
+            context_line = ""
+            if stage is not None:
+                context_line += f"Current stage: {stage}. "
+            if just_died:
+                context_line += (
+                    f"The agent just respawned (total deaths this session: {death_count}). "
+                    "Be cautious — look before moving. "
+                )
+
+            prompt = context_line + "What action should the agent take next?" if context_line else "What action should the agent take next?"
+
             response = self._client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=[image_part],
+                contents=[image_part, prompt],
                 config=types.GenerateContentConfig(
                     system_instruction=_SYSTEM_PROMPT,
                     temperature=0.2,
