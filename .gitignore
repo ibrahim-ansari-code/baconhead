@@ -1,8 +1,32 @@
+# Environment
 .env
 .venv/
+
+# Python
 __pycache__/
 *.pyc
-reward_model.pt
+*.pyo
+
+# Model weights (large binary files)
+*.pt
+*.pth
+*.onnx
+policy_model.json
+
+# Data directories (generated at runtime)
 reward_data/
-policy_model.pt
+policy_data/
 recording_frames/
+episode_data/
+look_calib_shots/
+
+# Logs
+bot_log.tsv
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

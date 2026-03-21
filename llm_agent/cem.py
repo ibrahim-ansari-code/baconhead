@@ -113,9 +113,7 @@ def run_cem(
     return best_action, scores, scores[idx], objectives, popup, duration_override
 
 
-# Base look speed: pixels per ms. Roblox camera scales linearly with drag distance.
-# 220px / 400ms = 0.55 px/ms — a 400ms look rotates ~45 degrees.
-LOOK_PX_PER_MS = 0.55
+from llm_agent.physics import LOOK_PX_PER_MS  # 0.55 px/ms (220px over 400ms)
 LOOK_DY = 0
 
 KEY_MAP = {
