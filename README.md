@@ -1,8 +1,34 @@
-# baconhead
+<div align="center">
 
-roblox bot that watches you play, learns game states from your gameplay, and takes over when you go idle.
+<img src="assets/banner.png" alt="baconhead" style="border-radius: 12px; width: 100%;" />
 
-uses claude vision to understand what's on screen and plan actions. trains a local vit model (GameSense) to detect death screens, danger zones, and menus — no hardcoded game knowledge, works on any roblox game.
+<br />
+<br />
+
+<a href="https://baconhead-page.vercel.app/">
+  <img src="https://img.shields.io/badge/website-baconhead-black?style=for-the-badge&logo=vercel&logoColor=white" alt="Website" />
+</a>
+&nbsp;
+<a href="https://discord.gg/AYyU5JZ4UK">
+  <img src="https://img.shields.io/badge/discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord" />
+</a>
+
+<br />
+<br />
+
+**roblox bot that watches you play, learns game states from your gameplay, and takes over when you go idle.**
+
+uses claude vision to understand what's on screen and plan actions. trains a local ViT model (GameSense) to detect death screens, danger zones, and menus — no hardcoded game knowledge, works on any roblox game.
+
+</div>
+
+---
+
+## demo
+
+https://github.com/user-attachments/assets/duders.mov
+
+---
 
 ## how it works
 
@@ -11,6 +37,8 @@ uses claude vision to understand what's on screen and plan actions. trains a loc
 3. claude looks at your screen and decides what to do
 4. GameSense (trained from your gameplay) detects deaths, danger, menus
 5. you press any key and you're back in control
+
+---
 
 ## setup
 
@@ -25,6 +53,8 @@ cp .env.example .env
 
 macos only rn. needs accessibility permission for keyboard/mouse control:
 **System Settings → Privacy & Security → Accessibility** → add your terminal app.
+
+---
 
 ## train GameSense
 
@@ -41,6 +71,8 @@ python -m vision.train --data game_data --out game_sense.pt --epochs 10
 ```
 
 prints per-class precision/recall when done. more data = better model.
+
+---
 
 ## run
 
@@ -61,12 +93,16 @@ python run_takeover.py --no-scout
 python run_capture.py --report --seconds 30
 ```
 
+---
+
 ## contribute
 
 1. fork this repo
 2. create a branch (`git checkout -b my-feature`)
 3. make your changes
 4. open a PR
+
+---
 
 ## todo
 
