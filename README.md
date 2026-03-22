@@ -26,7 +26,7 @@ uses claude vision to understand what's on screen and plan actions. trains a loc
 
 ## demo
 
-https://github.com/user-attachments/assets/duders.mov
+<img src="assets/demo.gif" alt="baconhead demo" style="border-radius: 12px; width: 100%;" />
 
 ---
 
