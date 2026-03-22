@@ -67,5 +67,10 @@ Every module must have a corresponding validation script in `scripts/` before it
 - Validate the module against the real Roblox environment — no mocked data
 - If the script captures the screen at any point, print a countdown (e.g. "Switch to Roblox now — starting in 3... 2... 1...") before the first capture so the tester has time to focus the Roblox window
 
+## Current focus
+- Agent cannot yet complete a single checkpoint reliably.
+- Priority is improving action quality via Gemini planner integration into the two-tier agent.
+- Stage-based reward improvements are deferred until the agent can actually advance stages.
+
 ## Sub-module docs
 Each subfolder has its own CLAUDE.md. Always read the relevant subfolder CLAUDE.md before working in that module. When in doubt about scope, refer back to this file.

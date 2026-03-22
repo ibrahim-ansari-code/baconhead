@@ -34,8 +34,8 @@ class BackgroundRetrainer:
         self,
         demos_dir: str | Path = "demos",
         checkpoint_dir: str | Path = "checkpoints",
-        min_new_runs: int = 3,
-        retrain_interval_minutes: float = 15.0,
+        min_new_runs: int = 1,
+        retrain_interval_minutes: float = 5.0,
     ) -> None:
         self._demos_dir = Path(demos_dir)
         self._checkpoint_dir = Path(checkpoint_dir)
@@ -79,7 +79,7 @@ class BackgroundRetrainer:
     def _daemon_loop(self) -> None:
         """Check every 60s whether to kick off a retrain."""
         while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=60.0)
+            self._stop_event.wait(timeout=30.0)
             if self._stop_event.is_set():
                 break
 

@@ -14,7 +14,8 @@ class RewardCalculator:
 
     def compute(
         self,
-        progress: float | None,
+        prev_stage: int | None,
+        curr_stage: int | None,
         death_event: bool,
         stuck: bool,
     ) -> float:

@@ -2,7 +2,7 @@
 agent/experience_recorder.py — Records successful agent runs as new demo data.
 
 Buffers (frame, action) pairs during TwoTierAgent runs and saves
-stage-advancing sequences as new demo runs in BCDataset-compatible format.
+long-survival sequences as new demo runs in BCDataset-compatible format.
 """
 
 from __future__ import annotations
@@ -22,85 +22,98 @@ class ExperienceRecorder:
     """
     Records agent experience and flushes successful runs as new demo data.
 
-    Only flushes when the agent achieves >= min_stage_advances distinct
-    stage advances in a single run, to prevent low-quality data from
-    polluting the training set.
+    Segments runs into "lives" (frames between deaths). Only saves lives
+    where the agent survived at least min_survival_frames, trimming
+    pre-death mistake frames from the end of each life.
 
     Args:
         demos_dir: Path to demos/ directory.
-        min_stage_advances: Minimum distinct stage advances required to flush.
+        min_survival_frames: Minimum frames in a life to consider it good data.
         buffer_max_frames: Maximum frames to buffer before dropping oldest.
-        death_exclusion_frames: Frames to roll back on death (likely mistakes).
+        death_exclusion_frames: Frames to trim from end of each life (pre-death mistakes).
     """
 
     def __init__(
         self,
         demos_dir: str | Path = "demos",
-        min_stage_advances: int = 2,
+        min_survival_frames: int = 600,
         buffer_max_frames: int = 4000,
         death_exclusion_frames: int = 10,
     ) -> None:
         self._demos_dir = Path(demos_dir)
-        self._min_stage_advances = min_stage_advances
+        self._min_survival_frames = min_survival_frames
         self._buffer_max_frames = buffer_max_frames
         self._death_exclusion_frames = death_exclusion_frames
 
         # Buffer: list of (processed_frame, action, stage) tuples
         self._buffer: list[tuple[np.ndarray, int, int]] = []
-        self._last_advance_idx: int = 0
-        self._stage_advance_count: int = 0
-        self._last_stage: int | None = None
+        self._current_life_start: int = 0
+        self._good_segments: list[tuple[int, int]] = []
 
     def record(self, frame_bgr: np.ndarray, action: int, stage: int) -> None:
         """Record a single (frame, action) pair. Preprocesses frame immediately."""
         processed = preprocess_frame(frame_bgr)
 
         if len(self._buffer) >= self._buffer_max_frames:
-            # Drop oldest frames but preserve advance cursor validity
             drop = len(self._buffer) - self._buffer_max_frames + 1
             self._buffer = self._buffer[drop:]
-            self._last_advance_idx = max(0, self._last_advance_idx - drop)
+            # Adjust all cursors
+            self._current_life_start = max(0, self._current_life_start - drop)
+            self._good_segments = [
+                (max(0, s - drop), max(0, e - drop))
+                for s, e in self._good_segments
+                if e - drop > 0
+            ]
 
         self._buffer.append((processed, action, stage))
 
-        if self._last_stage is None:
-            self._last_stage = stage
-
-    def on_stage_advance(self, new_stage: int) -> None:
-        """Called when the agent advances to a new stage."""
-        self._last_advance_idx = len(self._buffer)
-        self._stage_advance_count += 1
-        self._last_stage = new_stage
-        log.info(
-            "Stage advance #%d to stage %d (buffer=%d frames)",
-            self._stage_advance_count, new_stage, len(self._buffer),
-        )
-
     def on_death(self) -> None:
-        """Roll back the advance cursor to exclude pre-death mistake frames."""
-        rollback = min(self._death_exclusion_frames, self._last_advance_idx)
-        self._last_advance_idx = max(0, self._last_advance_idx - rollback)
-        log.debug("Death rollback: advance cursor -> %d", self._last_advance_idx)
+        """End the current life and record it if it was long enough."""
+        life_len = len(self._buffer) - self._current_life_start
+        end = len(self._buffer) - self._death_exclusion_frames
+        if life_len >= self._min_survival_frames and end > self._current_life_start:
+            self._good_segments.append((self._current_life_start, end))
+            log.info(
+                "Good life recorded: %d frames (trimmed to %d)",
+                life_len, end - self._current_life_start,
+            )
+        else:
+            log.debug(
+                "Short life discarded: %d frames (need %d)",
+                life_len, self._min_survival_frames,
+            )
+        self._current_life_start = len(self._buffer)
 
     def flush_run(self) -> Path | None:
         """
-        Flush buffered data as a new demo run if quality threshold is met.
+        Flush buffered data as a new demo run if any good segments exist.
 
         Returns:
-            Path to the new run directory, or None if quality gate not met.
+            Path to the new run directory, or None if no good segments.
         """
-        if self._stage_advance_count < self._min_stage_advances:
+        # Include the final life (from last death to end of buffer) if it qualifies
+        final_life_len = len(self._buffer) - self._current_life_start
+        if final_life_len >= self._min_survival_frames:
+            end = len(self._buffer) - self._death_exclusion_frames
+            if end > self._current_life_start:
+                self._good_segments.append((self._current_life_start, end))
+                log.info("Final life qualified: %d frames", end - self._current_life_start)
+
+        if not self._good_segments:
             log.info(
-                "Flush skipped: only %d stage advances (need %d)",
-                self._stage_advance_count, self._min_stage_advances,
+                "Flush skipped: no lives exceeded %d frames",
+                self._min_survival_frames,
             )
             self._reset_buffer()
             return None
 
-        # Only save frames up to the last advance cursor
-        good_data = self._buffer[: self._last_advance_idx]
+        # Concatenate all good segments
+        good_data: list[tuple[np.ndarray, int, int]] = []
+        for start, end in self._good_segments:
+            good_data.extend(self._buffer[start:end])
+
         if len(good_data) == 0:
-            log.info("Flush skipped: no good frames after cursor trim")
+            log.info("Flush skipped: no frames after segment assembly")
             self._reset_buffer()
             return None
 
@@ -117,16 +130,18 @@ class ExperienceRecorder:
 
         meta = {
             "source": "self_play",
+            "quality_gate": "survival_time",
             "num_frames": len(good_data),
-            "stage_advances": self._stage_advance_count,
+            "num_segments": len(self._good_segments),
+            "min_survival_frames": self._min_survival_frames,
             "final_stage": good_data[-1][2],
         }
         with open(run_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
 
         log.info(
-            "Flushed self-demo: %s (%d frames, %d stage advances)",
-            run_dir.name, len(good_data), self._stage_advance_count,
+            "Flushed self-demo: %s (%d frames from %d good lives)",
+            run_dir.name, len(good_data), len(self._good_segments),
         )
 
         self._reset_buffer()
@@ -149,6 +164,5 @@ class ExperienceRecorder:
     def _reset_buffer(self) -> None:
         """Clear the buffer and counters for the next run."""
         self._buffer.clear()
-        self._last_advance_idx = 0
-        self._stage_advance_count = 0
-        self._last_stage = None
+        self._current_life_start = 0
+        self._good_segments.clear()

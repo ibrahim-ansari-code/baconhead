@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--no-gemini", action="store_true", help="CNN only, no planner bias")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to CNN checkpoint")
     parser.add_argument("--bias-scale", type=float, default=None, help="Planner bias scale (default: from config)")
+    parser.add_argument("--self-improve", action="store_true", help="Enable self-improvement (record demos + background retraining)")
     args = parser.parse_args()
 
     print(f"Switch to Roblox now — starting in 3... ", end="", flush=True)
@@ -47,8 +48,7 @@ def main() -> None:
     agent = TwoTierAgent(
         capturer=capturer,
         checkpoint_path=args.checkpoint,
-        bias_scale=args.bias_scale,
-        use_gemini=not args.no_gemini,
+        enable_self_improvement=args.self_improve,
     )
     agent.run(duration_seconds=args.duration, dry_run=args.dry)
 

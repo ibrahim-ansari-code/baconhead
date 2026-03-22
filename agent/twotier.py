@@ -28,13 +28,15 @@ from control.actions import (
     release_all,
     set_camera_angle,
 )
+from agent.planner import GeminiPlanner
 from vision.model import ObbyCNN
-from vision.preprocess import preprocess_frame
+from vision.preprocess import preprocess_frame, preprocess_frame_rgb224
 from vision.stacker import FrameStacker
 
 log = logging.getLogger(__name__)
 
 _CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
+_ACTION_NAME_TO_IDX = {name: i for i, name in enumerate(ACTION_NAMES)}
 
 
 def _load_twotier_config() -> dict:
@@ -66,25 +68,57 @@ class TwoTierAgent:
         self._respawn_timeout: float = cfg.get("respawn_timeout", 10.0)
         self._respawn_void_threshold: float = cfg.get("respawn_void_threshold", 0.3)
 
-        # CNN — default path is same file that scripts/train_bc.py saves (bc_best.pt)
-        _default_cp = cfg.get("checkpoint", "checkpoints/bc_best.pt")
-        cp = checkpoint_path or _default_cp
-        if not Path(cp).is_absolute():
-            cp = str(Path(__file__).resolve().parent.parent / cp)
+        # Model type
+        self._model_type: str = cfg.get("model_type", "cnn")
         self._device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        self._model = ObbyCNN(n_actions=6)
-        state = torch.load(cp, map_location=self._device, weights_only=False)
-        if "model_state_dict" in state:
-            self._model.load_state_dict(state["model_state_dict"])
-        else:
-            self._model.load_state_dict(state)
-        self._model.to(self._device)
-        self._model.eval()
-        self._model_lock = threading.RLock()
-        log.info("CNN loaded from %s on %s", cp, self._device)
 
-        # Frame stacker
-        self._stacker = FrameStacker(stack_size=4)
+        # Load model based on type
+        if self._model_type == "siglip":
+            from vision.siglip_model import SigLIPObbyModel
+            _default_cp = cfg.get("siglip_checkpoint", "checkpoints/siglip_best.pt")
+            cp = checkpoint_path or _default_cp
+            if not Path(cp).is_absolute():
+                cp = str(Path(__file__).resolve().parent.parent / cp)
+            self._model = SigLIPObbyModel(n_actions=6)
+            state = torch.load(cp, map_location=self._device, weights_only=False)
+            if "model_state_dict" in state:
+                self._model.load_state_dict(state["model_state_dict"])
+            else:
+                self._model.load_state_dict(state)
+            self._model.to(self._device)
+            self._model.eval()
+            log.info("SigLIP2 model loaded from %s on %s", cp, self._device)
+        else:
+            _default_cp = cfg.get("checkpoint", "checkpoints/bc_best.pt")
+            cp = checkpoint_path or _default_cp
+            if not Path(cp).is_absolute():
+                cp = str(Path(__file__).resolve().parent.parent / cp)
+            self._model = ObbyCNN(n_actions=6)
+            state = torch.load(cp, map_location=self._device, weights_only=False)
+            if "model_state_dict" in state:
+                self._model.load_state_dict(state["model_state_dict"])
+            else:
+                self._model.load_state_dict(state)
+            self._model.to(self._device)
+            self._model.eval()
+            log.info("CNN loaded from %s on %s", cp, self._device)
+
+        self._model_lock = threading.RLock()
+
+        # Frame stacker (only used in CNN mode)
+        self._stacker = FrameStacker(stack_size=4) if self._model_type == "cnn" else None
+
+        # Gemini planner
+        self._planner = GeminiPlanner()
+
+        # Planner integration config
+        self._bias_scale = cfg.get("bias_scale", 2.0)
+        self._uncertainty_threshold = cfg.get("uncertainty_threshold", 0.5)
+        self._gemini_override_threshold = cfg.get("gemini_override_threshold", 0.65)
+        self._gemini_commit_frames = cfg.get("gemini_commit_frames", 10)
+        self._idle_suppress_threshold = cfg.get("idle_suppress_threshold", 0.7)
+        self._commit_action: int = 0
+        self._commit_remaining: int = 0
 
         # Death tracking
         self._deaths: int = 0
@@ -107,7 +141,10 @@ class TwoTierAgent:
         if enable_self_improvement:
             from agent.experience_recorder import ExperienceRecorder
             from agent.background_retrainer import BackgroundRetrainer
-            self._recorder = ExperienceRecorder(demos_dir="demos")
+            self._recorder = ExperienceRecorder(
+                demos_dir="demos",
+                min_survival_frames=cfg.get("min_survival_frames", 600),
+            )
             self._retrainer = BackgroundRetrainer(demos_dir="demos", checkpoint_dir="checkpoints")
             self._retrainer.start()
             t = threading.Thread(target=self._hotswap_loop, daemon=True)
@@ -138,8 +175,9 @@ class TwoTierAgent:
         # Initial capture and stacker reset
         self._capturer.tick()
         frame = self._capturer.last_frame
-        processed = preprocess_frame(frame)
-        self._stacker.reset(processed)
+        if self._stacker is not None:
+            processed = preprocess_frame(frame)
+            self._stacker.reset(processed)
 
         if self._reward_calc is not None:
             pass  # RewardCalculator is stateless; nothing to reset
@@ -148,6 +186,7 @@ class TwoTierAgent:
         start = time.monotonic()
         frame_count = 0
         prev_stage: int | None = None
+        prev_death_count: int = 0
 
         try:
             while time.monotonic() - start < duration_seconds:
@@ -164,7 +203,8 @@ class TwoTierAgent:
                     self._deaths += 1
                     if self._reward_calc is not None:
                         step_reward = self._reward_calc.compute(
-                            progress=None, death_event=True, stuck=False
+                            prev_stage=prev_stage, curr_stage=prev_stage,
+                            death_event=True, stuck=False,
                         )
                         self._episode_reward += step_reward
                         self._latest_progress = None
@@ -182,23 +222,64 @@ class TwoTierAgent:
                     frame_count += 1
                     continue
 
-                # 3. Preprocess and stack
+                # 3. Preprocess
                 frame = self._capturer.last_frame
-                processed = preprocess_frame(frame)
-                stacked = self._stacker.push(processed)
+                if self._model_type == "siglip":
+                    processed_rgb = preprocess_frame_rgb224(frame)
+                    logits = self._cnn_inference(processed_rgb)
+                else:
+                    processed = preprocess_frame(frame)
+                    stacked = self._stacker.push(processed)
+                    logits = self._cnn_inference(stacked)
 
-                # 4. CNN inference
-                logits = self._cnn_inference(stacked)
+                # 5. Planner bias
+                just_died = self._deaths > prev_death_count
+                prev_death_count = self._deaths
+                plan = self._planner.tick(
+                    frame,
+                    stage=self._capturer.current_stage,
+                    just_died=just_died,
+                    death_count=self._deaths,
+                )
 
-                # 5. Select action
-                action = int(np.argmax(logits))
-                # Idle suppression: if CNN picks idle, fall back to best non-idle action
-                if action == 5:
-                    non_idle_logits = logits.copy()
-                    non_idle_logits[5] = -np.inf
-                    action = int(np.argmax(non_idle_logits))
-                    if frame_count % 20 == 0:
-                        log.info("Frame %d: idle suppressed → %s", frame_count, ACTION_NAMES[action])
+                planner_action_idx = _ACTION_NAME_TO_IDX.get(plan["instruction"])
+
+                if (
+                    planner_action_idx is not None
+                    and plan["confidence"] >= self._gemini_override_threshold
+                ):
+                    probs = np.exp(logits - np.max(logits))
+                    probs /= probs.sum()
+                    cnn_max_prob = probs.max()
+
+                    if cnn_max_prob < self._uncertainty_threshold:
+                        logits[planner_action_idx] += self._bias_scale
+                        self._commit_action = planner_action_idx
+                        self._commit_remaining = self._gemini_commit_frames
+                        log.info(
+                            "Frame %d: Gemini bias → %s (conf=%.2f, cnn_max=%.2f)",
+                            frame_count, plan["instruction"], plan["confidence"], cnn_max_prob,
+                        )
+
+                # 6. Select action (commit window or argmax)
+                if self._commit_remaining > 0:
+                    action = self._commit_action
+                    self._commit_remaining -= 1
+                else:
+                    action = int(np.argmax(logits))
+
+                # Idle suppression: confidence-gated, skip during commit window
+                if action == 5 and self._commit_remaining <= 0:
+                    probs = np.exp(logits - np.max(logits))
+                    probs /= probs.sum()
+                    if probs[5] < self._idle_suppress_threshold:
+                        non_idle_logits = logits.copy()
+                        non_idle_logits[5] = -np.inf
+                        action = int(np.argmax(non_idle_logits))
+                        if frame_count % 20 == 0:
+                            log.info("Frame %d: idle suppressed → %s", frame_count, ACTION_NAMES[action])
+                    elif frame_count % 20 == 0:
+                        log.info("Frame %d: idle respected (prob=%.2f)", frame_count, probs[5])
 
                 if frame_count % 20 == 0:  # log once per second at 20fps
                     log.info(
@@ -225,8 +306,10 @@ class TwoTierAgent:
 
                 # Reward tracking
                 if self._reward_calc is not None:
+                    curr_stage = self._capturer.current_stage
                     step_reward = self._reward_calc.compute(
-                        progress=self._latest_progress, death_event=False, stuck=False
+                        prev_stage=prev_stage, curr_stage=curr_stage,
+                        death_event=False, stuck=False,
                     )
                     self._episode_reward += step_reward
                     if frame_count % 20 == 0:
@@ -235,12 +318,10 @@ class TwoTierAgent:
                             frame_count, step_reward, self._episode_reward,
                         )
 
-                # Self-improvement: record frame and detect stage advances
+                # Self-improvement: record frame
                 if self._recorder is not None:
                     curr_stage = self._capturer.current_stage
                     self._recorder.record(self._capturer.last_frame, action, curr_stage)
-                    if prev_stage is not None and curr_stage > prev_stage:
-                        self._recorder.on_stage_advance(curr_stage)
                     prev_stage = curr_stage
 
                 frame_count += 1
@@ -278,7 +359,7 @@ class TwoTierAgent:
         """Daemon thread: polls for bc_pending.flag and hot-swaps model weights."""
         flag = Path("checkpoints/bc_pending.flag")
         while True:
-            time.sleep(30)
+            time.sleep(10)
             if flag.exists():
                 try:
                     new_cp = flag.read_text().strip() or "checkpoints/bc_best.pt"
@@ -327,18 +408,24 @@ class TwoTierAgent:
         set_camera_angle()
         time.sleep(0.5)
 
-        # Reset stacker with fresh frame
+        # Reset stacker with fresh frame (CNN mode only)
         self._capturer.tick_fast()
-        processed = preprocess_frame(self._capturer.last_frame)
-        self._stacker.reset(processed)
+        if self._stacker is not None:
+            processed = preprocess_frame(self._capturer.last_frame)
+            self._stacker.reset(processed)
 
     # ------------------------------------------------------------------
     # CNN inference
     # ------------------------------------------------------------------
 
-    def _cnn_inference(self, stacked: np.ndarray) -> np.ndarray:
-        """Run CNN forward pass. Returns logits as numpy array of shape (6,)."""
-        tensor = torch.from_numpy(stacked).unsqueeze(0).to(self._device)
+    def _cnn_inference(self, frame_or_stack: np.ndarray) -> np.ndarray:
+        """Run model forward pass. Returns logits as numpy array of shape (6,).
+
+        Args:
+            frame_or_stack: Either a (4, 84, 84) grayscale stack (CNN mode)
+                            or a (3, 224, 224) RGB frame (SigLIP mode).
+        """
+        tensor = torch.from_numpy(frame_or_stack).unsqueeze(0).to(self._device)
         with self._model_lock:
             with torch.no_grad():
                 logits = self._model(tensor)

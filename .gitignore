@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
+# Too large for GitHub (>100MB); keep locally or use Git LFS
+checkpoints/siglip_best.pt

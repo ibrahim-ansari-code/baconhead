@@ -23,6 +23,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import mss
 import numpy as np
 from pynput import keyboard
@@ -30,7 +31,7 @@ from pynput import keyboard
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vision.preprocess import preprocess_frame
+from vision.preprocess import preprocess_frame, preprocess_frame_rgb224
 from control.actions import ACTION_NAMES, NUM_ACTIONS
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,7 @@ from control.actions import ACTION_NAMES, NUM_ACTIONS
 FPS = 5
 FRAME_INTERVAL = 1.0 / FPS
 COUNTDOWN_SECONDS = 5
-DEMOS_DIR = Path(__file__).resolve().parent.parent / "demos"
+DEMOS_DIR = Path(__file__).resolve().parent.parent / "demos_rgb"
 
 # Key-to-action mapping (priority order matches control/actions.py)
 # 0: forward (W), 1: left (A), 2: right (D), 3: jump (Space),
@@ -135,6 +136,7 @@ def main():
     listener.start()
 
     frames: list[np.ndarray] = []
+    raw_frames: list[np.ndarray] = []
     actions: list[int] = []
     start_time = time.time()
 
@@ -149,9 +151,14 @@ def main():
                 raw = sct.grab(monitor)
                 frame_bgr = np.array(raw)[:, :, :3]  # BGRA -> BGR
 
-                # Preprocess
+                # Preprocess grayscale (backward compat)
                 processed = preprocess_frame(frame_bgr)
                 frames.append(processed)
+
+                # Save raw RGB 224x224 for SigLIP2 training
+                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                resized_rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
+                raw_frames.append(resized_rgb)
 
                 # Read action from held keys
                 action = get_action()
@@ -178,9 +185,11 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     frames_arr = np.array(frames, dtype=np.float32)
+    raw_frames_arr = np.array(raw_frames, dtype=np.uint8)
     actions_arr = np.array(actions, dtype=np.int64)
 
     np.savez_compressed(run_dir / "frames.npz", frames=frames_arr)
+    np.savez_compressed(run_dir / "raw_frames.npz", frames=raw_frames_arr)
     np.save(run_dir / "actions.npy", actions_arr)
 
     # Action distribution

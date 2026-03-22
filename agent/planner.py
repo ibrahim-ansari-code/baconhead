@@ -3,6 +3,7 @@ agent/planner.py — Gemini high-level planner for the two-tier agent.
 
 Calls Gemini every INTERVAL seconds with a screenshot and returns a
 structured instruction dict. Between API calls, returns the cached result.
+The API call runs in a background thread so it never blocks the main loop.
 
 Public interface:
     GeminiPlanner.tick(frame: np.ndarray) -> dict
@@ -14,6 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import threading
 import time
 from io import BytesIO
 from typing import Optional
@@ -45,6 +48,9 @@ _SYSTEM_PROMPT = (
     "Respond with only valid JSON. No markdown, no explanation outside the JSON."
 )
 
+# Regex to extract JSON from responses that may include markdown fences
+_JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
 
 class GeminiPlanner:
     """
@@ -52,6 +58,7 @@ class GeminiPlanner:
 
     Calls the Gemini API at most once every INTERVAL seconds.
     Between calls, returns the cached last result.
+    API calls run in a background thread to avoid blocking the main loop.
     """
 
     VALID_INSTRUCTIONS = {"forward", "left", "right", "jump", "forward_jump", "idle"}
@@ -74,6 +81,8 @@ class GeminiPlanner:
             "confidence": 0.0,
             "reason": "init",
         }
+        self._pending: bool = False
+        self._lock = threading.Lock()
 
         log.info("GeminiPlanner ready (interval=%.1fs)", self.INTERVAL)
 
@@ -81,25 +90,54 @@ class GeminiPlanner:
     # Public interface
     # ------------------------------------------------------------------
 
-    def tick(self, frame: np.ndarray) -> dict:
+    def tick(
+        self,
+        frame: np.ndarray,
+        *,
+        stage: Optional[int] = None,
+        just_died: bool = False,
+        death_count: int = 0,
+    ) -> dict:
         """
         Return a planning decision for the given BGR frame.
 
         Uses cached result if called within INTERVAL seconds of the last
-        API call. Otherwise calls Gemini and updates the cache.
+        API call. Otherwise fires a background Gemini call and returns
+        cached until it completes.
         """
         now = time.time()
-        if now - self._last_call < self.INTERVAL:
-            return self._cached
+        if now - self._last_call >= self.INTERVAL and not self._pending:
+            self._last_call = now
+            self._pending = True
+            t = threading.Thread(
+                target=self._bg_call,
+                args=(frame.copy(), stage, just_died, death_count),
+                daemon=True,
+            )
+            t.start()
 
-        result = self._call_gemini(frame)
-        self._cached = result
-        self._last_call = now
-        return result
+        return self._cached
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _bg_call(
+        self,
+        frame: np.ndarray,
+        stage: Optional[int],
+        just_died: bool,
+        death_count: int,
+    ) -> None:
+        """Background thread: call Gemini and update cache."""
+        try:
+            result = self._call_gemini(
+                frame, stage=stage, just_died=just_died, death_count=death_count
+            )
+            with self._lock:
+                self._cached = result
+        finally:
+            self._pending = False
 
     def _call_gemini(
         self,
@@ -114,7 +152,6 @@ class GeminiPlanner:
             return self._cached
 
         try:
-            from google import genai  # noqa: F401 (ensure import)
             from google.genai import types
 
             # BGR → RGB → JPEG bytes
@@ -149,8 +186,22 @@ class GeminiPlanner:
                 ),
             )
 
-            raw_text = response.text.strip()
-            parsed = json.loads(raw_text)
+            raw_text = response.text if response.text else ""
+            raw_text = raw_text.strip()
+            if not raw_text:
+                log.warning("Gemini returned empty response — returning cached")
+                return self._cached
+
+            # Try direct parse first, then regex extract
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                match = _JSON_RE.search(raw_text)
+                if match:
+                    parsed = json.loads(match.group())
+                else:
+                    log.warning("Could not extract JSON from Gemini response: %r", raw_text[:200])
+                    return self._cached
 
             instruction = str(parsed.get("instruction", "idle")).lower()
             if instruction not in self.VALID_INSTRUCTIONS:

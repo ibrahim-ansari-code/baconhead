@@ -27,6 +27,30 @@ def preprocess_frame(frame_bgr: np.ndarray) -> np.ndarray:
     return normalized
 
 
+# ImageNet normalization constants
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def preprocess_frame_rgb224(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    Preprocess a raw BGR frame for SigLIP2.
+
+    Pipeline: BGR→RGB → resize 224×224 → float32 /255 → ImageNet normalize → CHW.
+
+    Args:
+        frame_bgr: Raw BGR frame from screen capture (any resolution).
+
+    Returns:
+        np.ndarray of shape (3, 224, 224), dtype float32, ImageNet-normalized.
+    """
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
+    normalized = resized.astype(np.float32) / 255.0
+    normalized = (normalized - _IMAGENET_MEAN) / _IMAGENET_STD
+    return normalized.transpose(2, 0, 1)  # HWC -> CHW
+
+
 def compute_motion_mask(
     prev_frame: np.ndarray,
     curr_frame: np.ndarray,

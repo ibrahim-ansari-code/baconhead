@@ -60,6 +60,7 @@ agent:
   llm_interval: 5.0
 
 twotier:
+  model_type: "siglip"  # "cnn" or "siglip"
   cnn_fps: 20
   bias_scale: 2.0
   respawn_wait: 3.0
@@ -67,10 +68,13 @@ twotier:
   respawn_void_threshold: 0.3
   ocr_every_n_frames: 10
   checkpoint: "checkpoints/bc_best.pt"
+  siglip_checkpoint: "checkpoints/siglip_best.pt"
   uncertainty_threshold: 0.5
   gemini_override_threshold: 0.65
   gemini_commit_frames: 10
   progress_every_n_frames: 40   # Gemini progress call interval (2s at 20fps)
+  idle_suppress_threshold: 0.7
+  min_survival_frames: 600  # 30s at 20fps — minimum life length to save as demo
 
 training:
   # Seconds without stage progress before stuck detection fires.

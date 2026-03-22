@@ -18,19 +18,20 @@ from torch.utils.data import Dataset
 class BCDataset(Dataset):
     """
     Behavioral cloning dataset that loads recorded demos and produces
-    4-frame stacks paired with action labels.
+    frame stacks (or single RGB frames) paired with action labels.
 
     Splits by run (not by frame) to prevent data leakage between
     train and val sets.
 
     Args:
         demos_dir: Path to demos/ directory containing run_NNN/ subdirs.
-        stack_size: Number of frames to stack (default 4).
+        stack_size: Number of frames to stack (default 4, ignored in rgb224 mode).
         split: 'train' or 'val'.
         val_ratio: Fraction of runs reserved for validation.
         seed: Random seed for reproducible train/val split.
         augment: If True, apply brightness jitter (train only).
         drop_idle: If True, remove all frames labeled idle (action 5) after loading.
+        mode: 'grayscale' for 4-frame 84x84 stacks, 'rgb224' for single 224x224 RGB frames.
     """
 
     def __init__(
@@ -42,24 +43,32 @@ class BCDataset(Dataset):
         seed: int = 42,
         augment: bool = False,
         drop_idle: bool = False,
+        mode: str = "grayscale",
     ) -> None:
         super().__init__()
         self.stack_size = stack_size
         self.split = split
         self.augment = augment and (split == "train")
+        self.mode = mode
 
         demos_path = Path(demos_dir)
         if not demos_path.exists():
             raise FileNotFoundError(f"Demos directory not found: {demos_path}")
 
-        # Discover all valid runs (must have frames.npz and actions.npy)
+        # Determine which frame file to look for based on mode
+        if mode == "rgb224":
+            frame_file = "raw_frames.npz"
+        else:
+            frame_file = "frames.npz"
+
+        # Discover all valid runs (must have frame file and actions.npy)
         all_runs = sorted(
             d for d in demos_path.iterdir()
-            if d.is_dir() and (d / "frames.npz").exists() and (d / "actions.npy").exists()
+            if d.is_dir() and (d / frame_file).exists() and (d / "actions.npy").exists()
         )
 
         if len(all_runs) == 0:
-            raise FileNotFoundError(f"No valid runs found in {demos_path}")
+            raise FileNotFoundError(f"No valid runs found in {demos_path} (looking for {frame_file})")
 
         # Split by run
         rng = np.random.RandomState(seed)
@@ -72,15 +81,15 @@ class BCDataset(Dataset):
         selected_runs = [all_runs[i] for i in sorted(selected_indices)]
 
         # Load all selected runs into memory
-        self._frames: list[np.ndarray] = []  # each: (N, 84, 84) float32
-        self._actions: list[np.ndarray] = []  # each: (N,) int
-        self._run_offsets: list[tuple[int, int]] = []  # (start_idx, length) per run
+        self._frames: list[np.ndarray] = []
+        self._actions: list[np.ndarray] = []
+        self._run_offsets: list[tuple[int, int]] = []
 
         total = 0
         for run_dir in selected_runs:
-            data = np.load(run_dir / "frames.npz")
-            frames = data["frames"]  # (N, 84, 84)
-            actions = np.load(run_dir / "actions.npy")  # (N,)
+            data = np.load(run_dir / frame_file)
+            frames = data["frames"]  # grayscale: (N, 84, 84), rgb224: (N, 224, 224, 3)
+            actions = np.load(run_dir / "actions.npy")
 
             assert frames.shape[0] == actions.shape[0], (
                 f"Frame/action count mismatch in {run_dir}: "
@@ -123,7 +132,21 @@ class BCDataset(Dataset):
         frames = self._frames[run_idx]
         action = int(self._actions[run_idx][frame_t])
 
-        # Build 4-frame stack: [t-3, t-2, t-1, t]
+        if self.mode == "rgb224":
+            # Single RGB frame: (224, 224, 3) uint8 → ImageNet-normalized (3, 224, 224)
+            frame = frames[frame_t].astype(np.float32) / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            frame = (frame - mean) / std
+            frame = frame.transpose(2, 0, 1)  # HWC -> CHW
+
+            if self.augment:
+                jitter = np.random.uniform(0.9, 1.1)
+                frame = frame * jitter
+
+            return torch.from_numpy(frame), action
+
+        # Grayscale mode: build 4-frame stack [t-3, t-2, t-1, t]
         # For early frames, pad by repeating frame 0 (matches FrameStacker behavior)
         stack_indices = [max(0, frame_t - (self.stack_size - 1 - i)) for i in range(self.stack_size)]
         stack = np.stack([frames[j] for j in stack_indices], axis=0)  # (4, 84, 84)
