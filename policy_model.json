@@ -1,6 +1,0 @@
-{
-  "backbone": "google/vit-base-patch16-224",
-  "num_actions": 8,
-  "frame_height": 224,
-  "frame_width": 224
-}

@@ -1,17 +1,12 @@
-# Capture config for Roblox gameplay
+# baconhead config
+
 capture:
   fps: 10
   region: null
   monitor: 0
 
-# Idle takeover + CEM
 agent:
-  idle_seconds: 3.0      # No key press for this long -> we take over
-  interval_seconds: 5.0  # T: run CEM every 5s
-  duration_ms: 5000      # Hold chosen key for this many milliseconds
+  idle_seconds: 3.0
 
-# Preset avoids (reward penalty when detected from frame)
-avoids:
-  losing_health: ["low health", "no health", "died", "death", "dead", "game over", "respawn", "failed"]
-  falling_off_map: ["falling", "fell", "void", "respawn", "out of bounds", "fell off", "death", "dead", "game over"]
-  death_screen: ["game over", "you died", "dead", "respawn", "defeat", "failed"]
+model:
+  game_sense: game_sense.pt

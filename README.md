@@ -1,130 +1,81 @@
-# Roblox auto-play (capture → vision → reward → CEM planning)
+# baconhead
 
-Capture Roblox gameplay, learn from the user, take over when idle, and execute CEM-style plans.
+roblox bot that watches you play, learns game states from your gameplay, and takes over when you go idle.
 
-## Todo list
+uses claude vision to understand what's on screen and plan actions. trains a local vit model (GameSense) to detect death screens, danger zones, and menus — no hardcoded game knowledge, works on any roblox game.
 
-- [x] **Capture** – Get gameplay from Roblox (screen capture, window or region, configurable FPS)
-- [x] **Reward model** – Learn r(s) from user play (active vs idle frames)
-- [x] **Preset avoids** – Losing health, falling off map, death screen (penalty in reward)
-- [x] **Combined reward** – r_total = r_cnn(s) - avoid_penalty(s)
-- [x] **Llama 4 Scout** – Groq Vision, score 10 actions per frame
-- [x] **CEM** – 10 options, score with Scout + reward model + avoids, pick best, ms timing
-- [x] **Idle takeover** – When idle N s, run CEM every 5s, execute best action for 5000 ms
+## how it works
 
-## Setup
+1. you play roblox normally
+2. after N seconds idle, the bot takes over
+3. claude looks at your screen and decides what to do
+4. GameSense (trained from your gameplay) detects deaths, danger, menus
+5. you press any key and you're back in control
+
+## setup
 
 ```bash
-cd "sf tripo"
+git clone https://github.com/your-username/baconhead.git
+cd baconhead
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+# add your ANTHROPIC_API_KEY to .env
 ```
 
-## Capture (current)
+macos only rn. needs accessibility permission for keyboard/mouse control:
+**System Settings → Privacy & Security → Accessibility** → add your terminal app.
+
+## train GameSense
+
+collect data by playing roblox (auto-labels frames from your gameplay):
 
 ```bash
-# Capture at 10 FPS; auto-detect Roblox window on Mac, else primary monitor
-python run_capture.py
-
-# Full primary monitor, no window detection
-python run_capture.py --no-window-detect
-
-# Custom region (left, top, width, height)
-python run_capture.py --region 100,100,1280,720
-
-# Different FPS
-python run_capture.py --fps 15
-
-# Report what we see (BLIP caption every N frames)
-python run_capture.py --report --report-every 15 --seconds 30
+python -m vision.collect --seconds 120 --out game_data
 ```
 
-Press Ctrl+C to stop. With `--report`, a vision model describes each Nth frame so you can confirm we're interpreting the screen.
-
-## Reward model
-
-Learns r(s) from your play: frames where you're pressing keys = high reward, idle = low. Used later for CEM planning.
-
-**1. Collect data** (play the game; we record frames + key state):
+train the model:
 
 ```bash
-# Default: save to reward_data/, sample every 3 frames, 84x84, active = key in last 2s
-python -m reward.collect --out-dir reward_data
-
-# Limit time or number of samples
-python -m reward.collect --out-dir reward_data --seconds 120
-python -m reward.collect --out-dir reward_data --max-samples 2000
+python -m vision.train --data game_data --out game_sense.pt --epochs 10
 ```
 
-On macOS, add **Terminal** (or **Python**) to **Accessibility** (System Settings → Privacy & Security → Accessibility), then quit and reopen Terminal. If key logging doesn’t work when the game is focused.
+prints per-class precision/recall when done. more data = better model.
 
-**2. Train**
+## run
 
 ```bash
-python -m reward.train_reward --data reward_data --out reward_model.pt --epochs 20
+# basic — takes over after 3s idle
+python run_takeover.py
+
+# custom idle time + trained model
+python run_takeover.py --idle 10 --model game_sense.pt
+
+# monitor decisions to a log file
+python run_takeover.py --idle 7 --model game_sense.pt --monitor bot_log.tsv
+
+# no claude (random actions, for testing)
+python run_takeover.py --no-scout
+
+# capture only (no bot, just screen grab)
+python run_capture.py --report --seconds 30
 ```
 
-**3. Use in code**
+## contribute
 
-```python
-from reward.model import load_reward_model
-import torch
-model = load_reward_model("reward_model.pt")
-# frame: (1, 3, 84, 84) tensor in [0,1]; or (B, 3, 84, 84)
-r = model(frame)
-```
+1. fork this repo
+2. create a branch (`git checkout -b my-feature`)
+3. make your changes
+4. open a PR
 
-## Full pipeline: notice play, reward model, then take over with CEM
+## todo
 
-1. **Collect** (notice how the player plays): `python -m reward.collect --out-dir reward_data --seconds 120`
-2. **Train** reward model: `python -m reward.train_reward --data reward_data --out reward_model.pt --epochs 20`
-3. **Take over when idle:** `python run_takeover.py` (Roblox window only; use `--full-screen` for whole screen, `--idle 3` to change idle seconds)
-
-When you don't press any key for `--idle` seconds (default 3), we run **CEM** every **5s**: 10 action options (W, A, S, D, space, none, …), score each with **Llama 4 Scout** (vision) and the **reward model**, subtract **preset avoid** penalty (losing health, falling off map, death screen), pick best, then execute that key for **5000 ms** (millisecond-accurate). Repeat until you press a key again.
-
-- **Preset avoids** ([reward/avoids.py](reward/avoids.py)): Keywords in frame caption (BLIP) trigger penalty: death, game over, falling, void, respawn, low health, etc. Combined with learned r(s) in [reward/combined.py](reward/combined.py).
-- **CEM** ([llm_agent/cem.py](llm_agent/cem.py)): `run_cem(frame, reward_model=..., scout_api_key=...)` returns best action and scores. `execute_action_ms(action, duration_ms=5000)` holds the key for the given milliseconds.
-
-## Policy model (fine-tuned vision)
-
-Train a Hugging Face vision model to predict the next action from a screenshot (no Scout API at inference). Multiple **oracles** define the "ideal" action per frame for labeling.
-
-**1. Collect data** (run Roblox; we capture and label with an oracle):
-
-```bash
-# avoid_only: BLIP detects danger -> none, else W (no API)
-python -m policy.collect --out-dir policy_data --oracle avoid_only --seconds 60
-
-# scout: use Llama Scout to label (needs GROQ_API_KEY)
-python -m policy.collect --out-dir policy_data --oracle scout --seconds 60
-
-# forward / random: baselines (fast, no vision API)
-python -m policy.collect --out-dir policy_data --oracle forward --max-samples 200
-```
-
-**2. Train** (ViT backbone + 8-class head):
-
-```bash
-python -m policy.train --data policy_data --out policy_model.pt --epochs 10 --freeze-backbone-epochs 2
-```
-
-**3. Take over with policy + monitoring**:
-
-```bash
-python run_takeover.py --policy policy_model.pt --monitor takeover_log.txt --interval 1.0
-```
-
-`--monitor` appends each decision (timestamp, source, action, duration_ms) so you can compare runs. Use **Scout** (default) for 10s plans or **--policy** for single-step model; try both and monitor which gets further in the obby.
-
-## Config
-
-[config.yaml](config.yaml): `capture.*`, `agent.idle_seconds`, `agent.interval_seconds`, `agent.duration_ms`, `avoids.*` (preset phrases for penalty).
-
-## Tests (offline, no Roblox)
-
-Run CEM + action-diversity tests with mock Scout (no API key needed):
-
-```bash
-python tests/test_cem_offline.py
-```
-
-Tests: Scout reply parsing, mock CEM prefers W when scored high, anti-repeat space after 2x jump, anti-repeat any action after 3x same, loop gets at least 2 distinct actions, and mock CEM runtime. With `GROQ_API_KEY` set, one real Scout call is timed for tuning intervals.
+- [ ] collect more training data across different roblox games
+- [ ] self-improving loop (bot labels its own gameplay data while running)
+- [ ] add temporal context to GameSense (sequence of frames, not just one)
+- [ ] obstacle avoidance from learned danger predictions
+- [ ] multi-platform support (windows, linux — currently macos only)
+- [ ] web dashboard for monitoring bot decisions live
+- [ ] support custom action spaces beyond WASD
+- [ ] fine-tune claude prompts based on per-game performance metrics
+- [ ] replay buffer for offline RL training

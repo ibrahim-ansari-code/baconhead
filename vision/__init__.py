@@ -1,3 +1,3 @@
-from .report import describe_frame, get_reporter
+from .game_sense import GameSense, load_game_sense, save_game_sense, heuristic_state
 
-__all__ = ["describe_frame", "get_reporter"]
+__all__ = ["GameSense", "load_game_sense", "save_game_sense", "heuristic_state"]

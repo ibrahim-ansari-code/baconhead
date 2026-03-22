@@ -7,17 +7,17 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Model weights (large binary files)
+# Model weights
 *.pt
 *.pth
 *.onnx
-policy_model.json
 
-# Data directories (generated at runtime)
-reward_data/
-policy_data/
-recording_frames/
+# Training data
+game_data/
 episode_data/
+policy_data/
+reward_data/
+recording_frames/
 look_calib_shots/
 
 # Logs
