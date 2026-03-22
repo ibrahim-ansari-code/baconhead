@@ -1,4 +1,10 @@
 .env
+# Planning / module build specs — keep locally, not in version control
+PHASES.md
+RISKS.md
+improvelogic.md
+**/CLAUDE.md
+
 __pycache__/
 *.pyc
 logs/
