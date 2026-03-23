@@ -9,5 +9,8 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
-# Too large for GitHub (>100MB); keep locally or use Git LFS
-checkpoints/siglip_best.pt
+
+# Datasets and weights — keep locally or distribute via Releases / LFS
+demos_cnn/
+demos_rgb/
+checkpoints/
