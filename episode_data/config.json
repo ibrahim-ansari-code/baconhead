@@ -1,0 +1,20 @@
+{
+  "total_episodes": 354,
+  "n_survived": 311,
+  "n_fell": 43,
+  "episode_secs": 10.0,
+  "n_buckets": 9,
+  "flow_fps": 5.0,
+  "frame_size": 224,
+  "max_key_events": 64,
+  "key_vocab": [
+    "w",
+    "a",
+    "s",
+    "d",
+    "space",
+    "shift",
+    "q",
+    "e"
+  ]
+}

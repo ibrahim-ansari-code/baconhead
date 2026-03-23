@@ -1,0 +1,19 @@
+{
+  "oracle": "scout",
+  "fps": 10.0,
+  "sample_every": 3,
+  "frame_height": 224,
+  "frame_width": 224,
+  "n_samples": 117,
+  "action_names": [
+    "W",
+    "A",
+    "S",
+    "D",
+    "space",
+    "none",
+    "look_left",
+    "look_right"
+  ],
+  "has_durations": true
+}
