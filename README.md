@@ -18,7 +18,7 @@
 
 **roblox bot that watches you play, learns game states from your gameplay, and takes over when you go idle.**
 
-uses claude vision to understand what's on screen and plan actions. trains a local ViT model (GameSense) to detect death screens, danger zones, and menus — no hardcoded game knowledge, works on any roblox game.
+uses vision model we trained to understand what's on screen and plan actions. trains a local ViT model (GameSense) to detect death screens, danger zones, and menus — no hardcoded game knowledge, works on any roblox game.
 
 </div>
 
