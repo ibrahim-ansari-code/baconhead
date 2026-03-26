@@ -76,12 +76,6 @@ prints per-class precision/recall when done. more data = better model.
 
 ## run
 
-For the obby-beating implementation, use the `ObbyBeater` branch:
-
-```bash
-git checkout ObbyBeater
-```
-
 ```bash
 # basic — takes over after 3s idle
 python run_takeover.py
@@ -97,6 +91,12 @@ python run_takeover.py --no-scout
 
 # capture only (no bot, just screen grab)
 python run_capture.py --report --seconds 30
+```
+
+For the obby-beating implementation, use the `ObbyBeater` branch:
+
+```bash
+git checkout ObbyBeater
 ```
 
 ---
