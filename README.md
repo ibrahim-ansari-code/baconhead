@@ -24,18 +24,6 @@ uses vision model we trained to understand what's on screen and plan actions. tr
 
 ---
 
-## branch notice
-
-If you're here for the obby-beating implementation, use the `ObbyBeater` branch.
-
-`main` is the default branch and may not contain the latest obby-beater code.
-
-```bash
-git checkout ObbyBeater
-```
-
----
-
 ## demo
 
 <img src="assets/demo.gif" alt="baconhead demo" style="border-radius: 12px; width: 100%;" />
@@ -87,6 +75,12 @@ prints per-class precision/recall when done. more data = better model.
 ---
 
 ## run
+
+For the obby-beating implementation, use the `ObbyBeater` branch:
+
+```bash
+git checkout ObbyBeater
+```
 
 ```bash
 # basic — takes over after 3s idle
